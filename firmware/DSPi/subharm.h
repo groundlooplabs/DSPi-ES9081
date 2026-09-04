@@ -95,10 +95,11 @@ static inline sh_num_t sh_band_limit(sh_num_t v) {
 }
 #endif
 
-// TPT state-variable filter (Cytomic form).  Integrator coefficients plus the
-// damping k the highpass/bell outputs need.
+// TPT state-variable filter (Cytomic form).  a3 is not stored: with a2 = g a1
+// and a3 = g a2 the lowpass update folds to v2 = ic2 + g v1, one multiply
+// fewer per step.  k is the damping the highpass/bell outputs need.
 typedef struct {
-    sh_num_t a1, a2, a3, k;
+    sh_num_t a1, a2, g, k;
 } SubharmSvf;
 
 typedef struct {

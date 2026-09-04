@@ -5,16 +5,17 @@ add_compile_options(-O2)
 
 # Use -O3 for DSP-critical files
 set_source_files_properties(
-    usb_audio.c vendor_commands.c audio_pipeline.c crossfeed.c loudness.c psybass.c subharm.c leveller.c crossover.c spdif_input.c i2s_input.c input_servo.c lg_sound_sync.c dac_hw_mute.c siggen.c upmix.c adat_output.c adat_input.c
+    usb_audio.c vendor_commands.c audio_pipeline.c crossfeed.c loudness.c psybass.c leveller.c crossover.c spdif_input.c i2s_input.c input_servo.c lg_sound_sync.c dac_hw_mute.c siggen.c upmix.c adat_output.c adat_input.c
     PROPERTIES COMPILE_FLAGS "-O3"
 )
 
 # dsp_pipeline.c is the only TU emitting the EQ kernels (inlined into
 # dsp_cascade_block). -ffp-contract=off is a measured 14-24% win there; M33
-# VFMA occupies the FPU ~2-2.5 cycles vs 1 for VMUL/VADD. See
-# "FP contraction" in Documentation/current_architecture.md before changing.
+# VFMA occupies the FPU ~2-2.5 cycles vs 1 for VMUL/VADD. subharm.c gets the
+# same flag on a static estimate (~9% fewer cycles, 25 -> 4 VMOVs); confirm on
+# the CPU meter. See "FP contraction" in Documentation/current_architecture.md.
 set_source_files_properties(
-    dsp_pipeline.c
+    dsp_pipeline.c subharm.c
     PROPERTIES COMPILE_FLAGS "-O3 -ffp-contract=off"
 )
 

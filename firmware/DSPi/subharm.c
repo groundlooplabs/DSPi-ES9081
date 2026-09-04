@@ -54,7 +54,7 @@ static void sh_svf_design(SubharmSvf *o, float fc, float k, float fs) {
     float a1 = 1.0f / (1.0f + g * (g + k));
     o->a1 = sh_from_float(a1);
     o->a2 = sh_from_float(g * a1);
-    o->a3 = sh_from_float(g * g * a1);
+    o->g  = sh_from_float(g);
     o->k  = sh_from_float(k);
 }
 
@@ -116,7 +116,7 @@ static inline __attribute__((always_inline))
 sh_num_t sh_svf(const SubharmSvf *c, sh_num_t *ic1, sh_num_t *ic2, sh_num_t x, sh_num_t *v1_out) {
     sh_num_t v3 = x - *ic2;
     sh_num_t v1 = sh_mul(c->a1, *ic1) + sh_mul(c->a2, v3);
-    sh_num_t v2 = *ic2 + sh_mul(c->a2, *ic1) + sh_mul(c->a3, v3);
+    sh_num_t v2 = *ic2 + sh_mul(c->g, v1);
     *ic1 = sh_twice(v1) - *ic1;
     *ic2 = sh_twice(v2) - *ic2;
     *v1_out = v1;

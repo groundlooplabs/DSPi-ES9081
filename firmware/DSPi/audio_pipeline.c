@@ -44,6 +44,9 @@ extern volatile uint8_t spdif0_consumer_fill;
 // Loudness compensation filter state lives in loudness.c
 // (loudness_output_state[NUM_OUTPUT_CHANNELS], shared with the Core 1 worker).
 
+// Subharm decimation phase reference: absolute sample count of the packet start.
+static uint32_t sh_sample_ctr = 0;
+
 // Crossfeed per-pair state and published coefficients live in crossfeed.c
 // (crossfeed_pair_state[NUM_SPDIF_INSTANCES], current_crossfeed_coeffs).
 
@@ -381,6 +384,11 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
     // core1_eq_work).  Runs per output pre-crossover, ahead of psybass.
     const SubharmCoeffs *sh_coeffs = (const SubharmCoeffs *)current_subharm_coeffs;
     uint16_t sh_mask = subharm_config.output_mask;
+    uint8_t  sh_flags = subharm_flags_snapshot();
+    // One decimation phase per packet for every output, so the sub path never
+    // drifts between slots when an output re-enters processing.
+    uint8_t  sh_phase = subharm_packet_phase(sh_coeffs, sh_sample_ctr);
+    sh_sample_ctr += sample_count;
 
     // Pre-compute PDM scale factor
     const float pdm_scale = (float)(1 << 28);
@@ -533,6 +541,8 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         core1_eq_work.psybass_mask = pb_mask;
         core1_eq_work.subharm_coeffs = sh_coeffs;
         core1_eq_work.subharm_mask = sh_mask;
+        core1_eq_work.subharm_flags = sh_flags;
+        core1_eq_work.subharm_phase = sh_phase;
         core1_eq_work.spdif_out[0] = audio_buf[1] ? (int32_t *)audio_buf[1]->buffer->bytes : NULL;
         core1_eq_work.spdif_out[1] = audio_buf[2] ? (int32_t *)audio_buf[2]->buffer->bytes : NULL;
         core1_eq_work.spdif_out[2] = audio_buf[3] ? (int32_t *)audio_buf[3]->buffer->bytes : NULL;
@@ -546,25 +556,19 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         // Pre-EQ so per-output (headphone) EQ shapes the post-crossfeed signal.
         crossfeed_process_pairs(xf_coeffs, xf_mask, 0, 0, buf_out, sample_count);
 
+        // Subharmonic synthesizer for Core 0's outputs, pre-crossover and
+        // ahead of psybass so it divides the program bass rather than
+        // synthesized harmonics.  Linked pairs, singles and resets are all
+        // decided inside the pass from the per-packet snapshot.
+        subharm_process_outputs(sh_coeffs, sh_mask, sh_flags, sh_phase,
+                                0, CORE1_EQ_FIRST_OUTPUT - 1, buf_out, sample_count);
+
         // Core 0: EQ + gain for outputs 0-1
         for (int out = 0; out < CORE1_EQ_FIRST_OUTPUT; out++) {
             if (!matrix_mixer.outputs[out].enabled) {
                 loudness_reset_output_state(&loudness_output_state[out]);
                 psybass_reset_output_state(&psybass_output_state[out]);
-                subharm_reset_output_state(&subharm_output_state[out]);
                 continue;
-            }
-            // Subharmonic synthesizer on masked outputs, pre-crossover and
-            // ahead of psybass so it divides the program bass rather than
-            // synthesized harmonics.  Skipped-and-cleared when masked off,
-            // muted, or RAW.
-            if (sh_coeffs && ((sh_mask >> out) & 1u)
-                && !matrix_mixer.outputs[out].mute
-                && !(siggen_raw_mask & (1u << out))) {
-                subharm_process_output_block(sh_coeffs, &subharm_output_state[out],
-                                             buf_out[out], sample_count);
-            } else {
-                subharm_reset_output_state(&subharm_output_state[out]);
             }
             // Psychoacoustic bass on masked outputs, pre-crossover (must see
             // the low band before any high-pass crossover removes it).
@@ -700,23 +704,17 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         crossfeed_process_pairs(xf_coeffs, xf_mask, 0, NUM_SPDIF_INSTANCES - 1,
                                 buf_out, sample_count);
 
+        // Subharmonic synthesizer, pre-crossover (see dual-core branch above).
+        subharm_process_outputs(sh_coeffs, sh_mask, sh_flags, sh_phase,
+                                0, NUM_OUTPUT_CHANNELS - 1, buf_out, sample_count);
+
         // EQ + gain (per-sample vol ramp, see Core 0 dual-core branch above for
         // rationale; steady-state step==0 falls back to constant-gain path).
         for (int out = 0; out < NUM_OUTPUT_CHANNELS; out++) {
             if (!matrix_mixer.outputs[out].enabled) {
                 loudness_reset_output_state(&loudness_output_state[out]);
                 psybass_reset_output_state(&psybass_output_state[out]);
-                subharm_reset_output_state(&subharm_output_state[out]);
                 continue;
-            }
-            // Subharmonic synthesizer, pre-crossover (see dual-core branch above).
-            if (sh_coeffs && ((sh_mask >> out) & 1u)
-                && !matrix_mixer.outputs[out].mute
-                && !(siggen_raw_mask & (1u << out))) {
-                subharm_process_output_block(sh_coeffs, &subharm_output_state[out],
-                                             buf_out[out], sample_count);
-            } else {
-                subharm_reset_output_state(&subharm_output_state[out]);
             }
             // Psychoacoustic bass, pre-crossover (see dual-core branch above).
             if (pb_coeffs && ((pb_mask >> out) & 1u)
@@ -896,6 +894,11 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
     // above): per output pre-crossover, ahead of psybass, shared with Core 1.
     const SubharmCoeffs *sh_coeffs = (const SubharmCoeffs *)current_subharm_coeffs;
     uint16_t sh_mask = subharm_config.output_mask;
+    uint8_t  sh_flags = subharm_flags_snapshot();
+    // One decimation phase per packet for every output, so the sub path never
+    // drifts between slots when an output re-enters processing.
+    uint8_t  sh_phase = subharm_packet_phase(sh_coeffs, sh_sample_ctr);
+    sh_sample_ctr += sample_count;
 
     // ========== PASS 2: Per-Input EQ + Metering ========== (RP2040: 2 inputs)
     for (int k = 0; k < NUM_INPUT_CHANNELS; k++) {
@@ -972,6 +975,8 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         core1_eq_work.psybass_mask = pb_mask;
         core1_eq_work.subharm_coeffs = sh_coeffs;
         core1_eq_work.subharm_mask = sh_mask;
+        core1_eq_work.subharm_flags = sh_flags;
+        core1_eq_work.subharm_phase = sh_phase;
         core1_eq_work.spdif_out[0] = audio_buf[1] ? (int32_t *)audio_buf[1]->buffer->bytes : NULL;
         core1_eq_work.work_done = false;
         __dmb();
@@ -982,25 +987,17 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         // Core 0 owns pair 0; Core 1 runs pair 1 inside eq_worker_loop.
         crossfeed_process_pairs(xf_coeffs, xf_mask, 0, 0, buf_out, sample_count);
 
+        // Subharmonic synthesizer for Core 0's outputs, pre-crossover and
+        // ahead of psybass (see the RP2350 branch above).
+        subharm_process_outputs(sh_coeffs, sh_mask, sh_flags, sh_phase,
+                                0, CORE1_EQ_FIRST_OUTPUT - 1, buf_out, sample_count);
+
         // Core 0: EQ + gain for outputs 0-1 (SPDIF pair 1)
         for (int out = 0; out < CORE1_EQ_FIRST_OUTPUT; out++) {
             if (!matrix_mixer.outputs[out].enabled) {
                 loudness_reset_output_state(&loudness_output_state[out]);
                 psybass_reset_output_state(&psybass_output_state[out]);
-                subharm_reset_output_state(&subharm_output_state[out]);
                 continue;
-            }
-            // Subharmonic synthesizer on masked outputs, pre-crossover and
-            // ahead of psybass so it divides the program bass rather than
-            // synthesized harmonics.  Skipped-and-cleared when masked off,
-            // muted, or RAW.
-            if (sh_coeffs && ((sh_mask >> out) & 1u)
-                && !matrix_mixer.outputs[out].mute
-                && !(siggen_raw_mask & (1u << out))) {
-                subharm_process_output_block(sh_coeffs, &subharm_output_state[out],
-                                             buf_out[out], sample_count);
-            } else {
-                subharm_reset_output_state(&subharm_output_state[out]);
             }
             // Psychoacoustic bass on masked outputs, pre-crossover (must see
             // the low band before any high-pass crossover removes it).
@@ -1125,23 +1122,17 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         crossfeed_process_pairs(xf_coeffs, xf_mask, 0, NUM_SPDIF_INSTANCES - 1,
                                 buf_out, sample_count);
 
+        // Subharmonic synthesizer, pre-crossover (see dual-core branch above).
+        subharm_process_outputs(sh_coeffs, sh_mask, sh_flags, sh_phase,
+                                0, NUM_OUTPUT_CHANNELS - 1, buf_out, sample_count);
+
         // EQ + gain (block-based, per-sample vol ramp; step==0 in steady state
         // → constant-gain path with no extra per-sample work).
         for (int out = 0; out < NUM_OUTPUT_CHANNELS; out++) {
             if (!matrix_mixer.outputs[out].enabled) {
                 loudness_reset_output_state(&loudness_output_state[out]);
                 psybass_reset_output_state(&psybass_output_state[out]);
-                subharm_reset_output_state(&subharm_output_state[out]);
                 continue;
-            }
-            // Subharmonic synthesizer, pre-crossover (see dual-core branch above).
-            if (sh_coeffs && ((sh_mask >> out) & 1u)
-                && !matrix_mixer.outputs[out].mute
-                && !(siggen_raw_mask & (1u << out))) {
-                subharm_process_output_block(sh_coeffs, &subharm_output_state[out],
-                                             buf_out[out], sample_count);
-            } else {
-                subharm_reset_output_state(&subharm_output_state[out]);
             }
             // Psychoacoustic bass, pre-crossover (see dual-core branch above).
             if (pb_coeffs && ((pb_mask >> out) & 1u)

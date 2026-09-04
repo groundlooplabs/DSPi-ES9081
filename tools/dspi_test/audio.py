@@ -593,6 +593,22 @@ def measure_tone_2ch(out_dev, in_dev, fs, freq=1000.0, dur_s=0.8, amp=0.4, left_
     return dbfs(s0), dbfs(s1), _thd_pct(s0, fs, freq)
 
 
+def _bins_dbfs(core, fs, probes):
+    """Hann-windowed FFT levels at `probes`, calibrated so a full-scale sine
+    reads 0 dBFS at its own bin.  The +/-2 bin search absorbs scalloping, which
+    is otherwise worth up to ~1.4 dB on a bin the tone falls between."""
+    win = np.hanning(len(core))
+    X = np.abs(np.fft.rfft(core * win)) * (2.0 / np.sum(win))
+    df = fs / len(core)
+    out = {}
+    for p in probes:
+        k = int(round(p / df))
+        a, b = max(k - 2, 0), min(k + 3, len(X))
+        peak = float(np.max(X[a:b])) if b > a else 0.0
+        out[p] = 20.0 * np.log10(max(peak, 1e-12))
+    return out
+
+
 def measure_tone_bins(out_dev, in_dev, in_channel, fs, freq, probes, dur_s=0.8, amp=0.4):
     """Play a sine at `freq`, capture it, and return {probe_hz: level_dbfs} for
     each probe frequency, read from a Hann-windowed FFT of the steady tail (so
@@ -607,17 +623,74 @@ def measure_tone_bins(out_dev, in_dev, in_channel, fs, freq, probes, dur_s=0.8, 
     y = cap[:, in_channel] if cap.ndim > 1 else cap
     seg, _strength = align(y, tone)
     lo, hi = int(0.30 * len(seg)), int(0.95 * len(seg))
-    core = seg[lo:hi]
-    win = np.hanning(len(core))
-    X = np.abs(np.fft.rfft(core * win)) * (2.0 / np.sum(win))
-    df = fs / len(core)
-    out = {}
-    for p in probes:
-        k = int(round(p / df))
-        a, b = max(k - 2, 0), min(k + 3, len(X))
-        peak = float(np.max(X[a:b])) if b > a else 0.0
-        out[p] = 20.0 * np.log10(max(peak, 1e-12))
-    return out
+    return _bins_dbfs(seg[lo:hi], fs, probes)
+
+
+def _envelope(x, fs, hop=32, smooth_ms=10.0):
+    """Rectified, box-smoothed, decimated amplitude envelope."""
+    m = np.abs(np.asarray(x, np.float64))
+    w = max(int(fs * smooth_ms / 1000.0), 1)
+    if len(m) <= w:
+        return np.zeros(0)
+    c = np.cumsum(np.concatenate([[0.0], m]))
+    return ((c[w:] - c[:-w]) / w)[::hop]
+
+
+def _envelope_lag(y, ref, fs, hop=32):
+    """Integer lag of `ref` inside `y` from their ENVELOPES, plus a strength.
+
+    Waveform correlation finds nothing when the device replaces its output with
+    a different frequency (subharm solo emits only the f/2 sub), but the two
+    bursts still share an envelope.  Accurate to `hop` samples, which is far
+    finer than the steady-tail window the caller then cuts.
+    """
+    ey, er = _envelope(y, fs, hop), _envelope(ref, fs, hop)
+    if len(er) == 0 or len(ey) <= len(er):
+        return 0, 0.0
+    # Only the capture's mean comes off: the reference envelope of a steady tone
+    # is nearly flat, and removing its mean would leave almost nothing to match.
+    ey = ey - ey.mean()
+    if _sp_correlate is not None:
+        corr = _sp_correlate(ey, er, mode="valid", method="fft")
+    else:
+        n = len(ey) - len(er) + 1
+        corr = np.array([np.dot(ey[i:i + len(er)], er) for i in range(n)])
+    k = int(np.argmax(corr))
+    seg = ey[k:k + len(er)]
+    denom = np.linalg.norm(er) * (np.linalg.norm(seg) + 1e-20)
+    return k * hop, float(corr[k] / (denom + 1e-20))
+
+
+def measure_tone_bins_2ch(out_dev, in_dev, fs, freq, probes, dur_s=0.8, amp=0.4,
+                          right_scale=1.0, envelope_align=False):
+    """Play a sine on the LEFT output and `right_scale` x it on the RIGHT, then
+    return ([{probe_hz: level_dbfs} for capture channels 0 and 1], strength).
+
+    `right_scale=-1` builds the anti-phase pair that a mono-summing stage must
+    cancel.  `envelope_align` locates the steady-tail window from the amplitude
+    envelope instead of the waveform, for a stage whose output carries nothing
+    at `freq` at all.
+    """
+    _require()
+    tone = make_tone(fs, freq, dur_s, amp)
+    pad = np.zeros(int(PAD_S * fs), np.float32)
+    sig = np.concatenate([pad, tone, pad])
+    exc = np.column_stack([sig, (right_scale * sig).astype(np.float32)])
+    cap = play_record(exc, fs, out_dev, in_dev)
+    if cap.shape[0] == 0:
+        return [{p: -200.0 for p in probes} for _ in range(2)], 0.0
+    if envelope_align:
+        lag, strength = _envelope_lag(cap[:, 0], tone, fs)
+    else:
+        lag, strength = _xcorr_lag(cap[:, 0], tone)
+    lo, hi = int(0.30 * len(tone)), int(0.95 * len(tone))
+    out = []
+    for ch in range(2):
+        seg = cap[lag:lag + len(tone), ch]
+        if len(seg) < len(tone):
+            seg = np.concatenate([seg, np.zeros(len(tone) - len(seg), np.float32)])
+        out.append(_bins_dbfs(seg[lo:hi], fs, probes))
+    return out, strength
 
 
 def _thd_pct(x, fs, f0, n_harm=6):

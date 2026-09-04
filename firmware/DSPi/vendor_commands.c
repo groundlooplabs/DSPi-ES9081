@@ -972,6 +972,85 @@ static bool vendor_handle_set_data(tusb_control_request_t const *req) {
             }
             break;
 
+        case REQ_SET_SUBHARM_TOP:
+            if (buffer->data_len >= 4) {
+                float val;
+                memcpy(&val, vendor_rx_buf, 4);
+                if (val < SUBHARM_LEVEL_MIN) val = SUBHARM_LEVEL_MIN;
+                if (val > SUBHARM_LEVEL_MAX) val = SUBHARM_LEVEL_MAX;
+                subharm_config.top_db = val;
+                subharm_update_pending = true;
+                notify_param_write(offsetof(WireBulkParams, subharm.top_db),
+                                   sizeof(float), &val);
+            }
+            break;
+
+        case REQ_SET_SUBHARM_SELECT:
+            if (buffer->data_len >= 1) {
+                uint8_t m = vendor_rx_buf[0];
+                if (m > SUBHARM_SELECT_MODE_MAX) m = SUBHARM_SELECT_MODE_MAX;
+                subharm_config.select_mode = m;
+                subharm_update_pending = true;
+                notify_param_write(offsetof(WireBulkParams, subharm.select_mode), 1, &m);
+            }
+            break;
+
+        case REQ_SET_SUBHARM_DEPTH:
+            if (buffer->data_len >= 4) {
+                float val;
+                memcpy(&val, vendor_rx_buf, 4);
+                if (val < SUBHARM_DEPTH_MIN) val = SUBHARM_DEPTH_MIN;
+                if (val > SUBHARM_DEPTH_MAX) val = SUBHARM_DEPTH_MAX;
+                subharm_config.select_depth = val;
+                subharm_update_pending = true;
+                notify_param_write(offsetof(WireBulkParams, subharm.select_depth),
+                                   sizeof(float), &val);
+            }
+            break;
+
+        case REQ_SET_SUBHARM_HOLD:
+            if (buffer->data_len >= 4) {
+                float val;
+                memcpy(&val, vendor_rx_buf, 4);
+                if (val < SUBHARM_HOLD_MIN) val = SUBHARM_HOLD_MIN;
+                if (val > SUBHARM_HOLD_MAX) val = SUBHARM_HOLD_MAX;
+                subharm_config.select_hold_ms = val;
+                subharm_update_pending = true;
+                notify_param_write(offsetof(WireBulkParams, subharm.select_hold_ms),
+                                   sizeof(float), &val);
+            }
+            break;
+
+        case REQ_SET_SUBHARM_CEILING:
+            if (buffer->data_len >= 4) {
+                float val;
+                memcpy(&val, vendor_rx_buf, 4);
+                if (val < SUBHARM_CEILING_MIN) val = SUBHARM_CEILING_MIN;
+                if (val > SUBHARM_CEILING_MAX) val = SUBHARM_CEILING_MAX;
+                subharm_config.ceiling_db = val;
+                subharm_update_pending = true;
+                notify_param_write(offsetof(WireBulkParams, subharm.ceiling_db),
+                                   sizeof(float), &val);
+            }
+            break;
+
+        case REQ_SET_SUBHARM_LINK:
+            if (buffer->data_len >= 1) {
+                subharm_config.link_pairs = (vendor_rx_buf[0] != 0);
+                // Read live each packet like the mask; no recompute needed.
+                uint8_t v = subharm_config.link_pairs ? 1 : 0;
+                notify_param_write(offsetof(WireBulkParams, subharm.link_pairs), 1, &v);
+            }
+            break;
+
+        case REQ_SET_SUBHARM_SOLO:
+            // Monitoring only, so it has no wire offset and no notify: solo is
+            // never persisted and a saved configuration can never boot in it.
+            if (buffer->data_len >= 1) {
+                subharm_config.solo = (vendor_rx_buf[0] != 0);
+            }
+            break;
+
         // Volume Leveller Commands
         case REQ_SET_LEVELLER_ENABLE:
             if (buffer->data_len >= 1) {
@@ -1997,6 +2076,49 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
                 float val = subharm_headroom_db(&cfg);
                 memcpy(resp_buf, &val, 4);
                 vendor_send_response(resp_buf, 4);
+                return true;
+            }
+
+            case REQ_GET_SUBHARM_TOP:
+            case REQ_GET_SUBHARM_DEPTH:
+            case REQ_GET_SUBHARM_HOLD:
+            case REQ_GET_SUBHARM_CEILING: {
+                float val = (setup->bRequest == REQ_GET_SUBHARM_TOP)   ? subharm_config.top_db
+                          : (setup->bRequest == REQ_GET_SUBHARM_DEPTH) ? subharm_config.select_depth
+                          : (setup->bRequest == REQ_GET_SUBHARM_HOLD)  ? subharm_config.select_hold_ms
+                                                                       : subharm_config.ceiling_db;
+                memcpy(resp_buf, &val, 4);
+                vendor_send_response(resp_buf, 4);
+                return true;
+            }
+
+            case REQ_GET_SUBHARM_SELECT: {
+                resp_buf[0] = subharm_config.select_mode;
+                vendor_send_response(resp_buf, 1);
+                return true;
+            }
+
+            case REQ_GET_SUBHARM_LINK: {
+                resp_buf[0] = subharm_config.link_pairs ? 1 : 0;
+                vendor_send_response(resp_buf, 1);
+                return true;
+            }
+
+            case REQ_GET_SUBHARM_SOLO: {
+                resp_buf[0] = subharm_config.solo ? 1 : 0;
+                vendor_send_response(resp_buf, 1);
+                return true;
+            }
+
+            case REQ_GET_SUBHARM_METER: {
+                // Same 0..32767 scale as SystemStatusPacket.peaks, so a host
+                // can drive one meter widget from either source.
+                for (uint8_t k = 0; k < NUM_OUTPUT_CHANNELS; k++) {
+                    uint16_t m = subharm_meter_u16(k);
+                    resp_buf[2 * k]     = (uint8_t)(m & 0xFF);
+                    resp_buf[2 * k + 1] = (uint8_t)((m >> 8) & 0xFF);
+                }
+                vendor_send_response(resp_buf, 2 * NUM_OUTPUT_CHANNELS);
                 return true;
             }
 

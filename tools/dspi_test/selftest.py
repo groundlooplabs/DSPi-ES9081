@@ -452,7 +452,8 @@ print("27. Phase 5 tests registered, and the replay block still comes last")
 audio_names = [tc.name for tc in REGISTRY if tc.group == "audio"]
 for n in ("peq_linkwitz_transform", "xo_all_band_slots", "xo_two_band_cascade",
           "loudness_output_mask", "upmix_centre_off_passthrough", "psybass_harmonics",
-          "subharm_octave"):
+          "subharm_octave", "subharm_top_band", "subharm_solo", "subharm_ceiling",
+          "subharm_selectivity", "subharm_link_pair", "subharm_meter"):
     check(n in audio_names, f"{n} registered")
 check(audio_names[-1] == "rate_switch_round_trip",
       f"round trip still last (got {audio_names[-1]!r})")
@@ -549,6 +550,45 @@ if A.np is not None and A.sd is not None:
     A._kill_worker()
 else:
     print("  (sounddevice/numpy missing: worker ping skipped)")
+
+print("33. subharm audio tests restore state, and never leak monitor solo")
+src_loop = pathlib.Path("tools/dspi_test/tests/audio_loopback.py").read_text()
+check("SET_SUBHARM_SOLO, 0" in inspect.getsource(L._subharm_restore),
+      "_subharm_restore forces solo off rather than restoring it")
+for name in ("subharm_top_band", "subharm_solo", "subharm_ceiling",
+             "subharm_selectivity", "subharm_link_pair", "subharm_meter"):
+    body = inspect.getsource(getattr(L, name))
+    check("finally:" in body and "_subharm_restore(dev, saved)" in body,
+          f"{name} restores every subharm field in a finally")
+solo_writers = [n for n in ("subharm_top_band", "subharm_solo", "subharm_ceiling",
+                            "subharm_selectivity", "subharm_link_pair", "subharm_meter")
+                if "SET_SUBHARM_SOLO, 1" in inspect.getsource(getattr(L, n))]
+for name in solo_writers:
+    body = inspect.getsource(getattr(L, name))
+    tail = body[body.rindex("finally:"):]
+    check("SET_SUBHARM_SOLO, 0" in tail, f"{name} turns solo off in its finally")
+check(solo_writers == ["subharm_solo"],
+      f"only subharm_solo enables monitor solo (got {solo_writers})")
+
+print("34. envelope alignment finds a burst at a frequency the reference lacks")
+if A.np is None:
+    print("  (numpy missing: skipped)")
+else:
+    _np = A.np
+    fs = 48000
+    ref = A.make_tone(fs, 60.0, 0.5, 0.4)
+    # What subharm solo returns: only the f/2 sub, which the 60 Hz reference
+    # does not correlate with at all.
+    sub = A.make_tone(fs, 30.0, 0.5, 0.2)
+    lead = 7000
+    cap = _np.concatenate([_np.zeros(lead, _np.float32), sub,
+                           _np.zeros(4000, _np.float32)])
+    lag, strength = A._envelope_lag(cap, ref, fs)
+    check(abs(lag - lead) < 0.02 * fs, f"envelope lag {lag} ~ {lead} (within 20 ms)")
+    check(strength > 0.5, f"envelope alignment reports a strong lock ({strength:.2f})")
+    wave_lag, wave_strength = A._xcorr_lag(cap, ref)
+    check(wave_strength < strength,
+          f"waveform correlation is the weaker lock ({wave_strength:.2f} at lag {wave_lag})")
 
 print()
 print("FAILURES:", len(fails))

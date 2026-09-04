@@ -129,8 +129,8 @@ extern volatile uint32_t nominal_feedback_10_14;
 #define MS_VENDOR_CODE      0x01
 
 // Control Surfaces target groups and macros (caps v9); see control_surfaces.h
-// and Documentation/Features/control_surfaces_groups_macros_spec.md.  0x10-0x1A
-// hold the subharmonic synthesizer (above); the rest of 0x00-0x1F stays
+// and Documentation/Features/control_surfaces_groups_macros_spec.md.  0x10-0x1F
+// and 0x2C-0x2F hold the subharmonic synthesizer (below); 0x00-0x0F stays
 // unallocated.  0x01 is MS_VENDOR_CODE above, intercepted in
 // tud_vendor_control_xfer_cb before the application dispatcher sees it.
 #define REQ_SET_CS_GROUP            0x20  // wValue = group (0-7), payload = 40-byte CsGroup;
@@ -169,6 +169,22 @@ extern volatile uint32_t nominal_feedback_10_14;
 #define REQ_SET_SUBHARM_MASK        0x18  // uint16 LE output mask
 #define REQ_GET_SUBHARM_MASK        0x19
 #define REQ_GET_SUBHARM_HEADROOM    0x1A  // float dB: preamp headroom to free
+// The block continues in the free ranges 0x1B-0x1F, 0x2C-0x2F and 0xA9-0xAE.
+#define REQ_SET_SUBHARM_TOP         0x1B  // float dB, 56-80 Hz band level
+#define REQ_GET_SUBHARM_TOP         0x1C
+#define REQ_SET_SUBHARM_SELECT      0x1D  // 1 byte SUBHARM_SELECT_* mode
+#define REQ_GET_SUBHARM_SELECT      0x1E
+#define REQ_GET_SUBHARM_METER       0x1F  // NUM_OUTPUT_CHANNELS x uint16 LE sub peaks
+#define REQ_SET_SUBHARM_SOLO        0x2C  // 1 byte 0/1; runtime only, never persisted
+#define REQ_GET_SUBHARM_SOLO        0x2D
+#define REQ_SET_SUBHARM_LINK        0x2E  // 1 byte 0/1, pair-linked synthesis
+#define REQ_GET_SUBHARM_LINK        0x2F
+#define REQ_SET_SUBHARM_DEPTH       0xA9  // float %, selectivity depth
+#define REQ_GET_SUBHARM_DEPTH       0xAA
+#define REQ_SET_SUBHARM_HOLD        0xAB  // float ms, selectivity hold time
+#define REQ_GET_SUBHARM_HOLD        0xAC
+#define REQ_SET_SUBHARM_CEILING     0xAD  // float dBFS sub ceiling (0 = off)
+#define REQ_GET_SUBHARM_CEILING     0xAE
 
 // Psychoacoustic bass enhancement (missing-fundamental harmonics; psybass.h)
 #define REQ_SET_PSYBASS             0x30
@@ -832,6 +848,8 @@ typedef struct {
     // Subharmonic synthesizer snapshot for THIS packet; same single-view rationale.
     const void       *subharm_coeffs;  // SubharmCoeffs or NULL = off
     uint16_t          subharm_mask;    // Bit k = process output k
+    uint8_t           subharm_flags;   // SUBHARM_FLAG_* (link pairs, solo)
+    uint8_t           subharm_phase;   // decimation phase at packet start
 } Core1EqWork;
 
 // ----------------------------------------------------------------------------

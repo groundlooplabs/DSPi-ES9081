@@ -1407,6 +1407,32 @@ UPMIX_ROW_LS = 3
 PSYBASS_CUTOFF, PSYBASS_HARMONICS, PSYBASS_DRIVE = 120.0, 12.0, 18.0
 SUBHARM_TONE = 60.0           # inside the 48-72 Hz band: sub lands at 30 Hz
 SUBHARM_MIN_RISE_DB = 20.0    # sub bin must rise at least this much when enabled
+SUBHARM_TOP_TONE = 128.0      # inside the 112-160 Hz third band: sub lands at 64 Hz
+SUBHARM_LEVEL_OFF_DB = -30.0  # SUBHARM_LEVEL_MIN: a band at the floor is skipped
+SUBHARM_SOLO_DROP_DB = 60.0   # dry tone must fall at least this far under solo
+SUBHARM_SOLO_TONE_S = 1.2
+SUBHARM_HOT_AMP = 0.8         # drives the uncapped sub well above the test ceilings
+SUBHARM_CEILING_DBFS = -20.0
+# The limiter drives the sub's PEAK to the ceiling; the 30 Hz bin sits a shade
+# under that, and the tolerance also covers FFT scalloping (offline kernel model).
+SUBHARM_CEILING_BIN_DBFS = -20.8
+SUBHARM_CEILING_TOL_DB = 2.5
+SUBHARM_SELECT_TONE_S = 1.5   # >= 1 s so the 30-95% window clears hold + release
+SUBHARM_SELECT_HOLD_MS = 100.0
+SUBHARM_SELECT_DROP_DB = 10.0     # percussive gates a sustained tone at least this far
+SUBHARM_SELECT_KEEP_TOL_DB = 1.5  # sustained must match "all" this closely
+# Meter (0x1F) scale: peak of the synthesized sub, 32767 = full scale.  With no
+# ceiling the divider leaves the sub 6.3 dB under the drive peak at 60 Hz.
+SUBHARM_METER_DRIVE_DB = -6.3
+SUBHARM_METER_TOL_DB = 3.0
+SUBHARM_METER_SETTLE_S = 1.5  # covers the 300 ms meter tau and the 200 ms ceiling release
+SUBHARM_METER_DRIVE_HI_DB = -6.0
+SUBHARM_METER_DRIVE_LO_DB = -18.0
+
+# siggen.h wire constants: a held tone lets a live meter be read while it plays.
+SIGGEN_CFG_VERSION = 1
+SIGGEN_SINE = 0
+SIGGEN_CTL_START = 1
 
 
 def _set_lt_band(dev, ch, band, f0, q0, fp, qp):
@@ -1631,6 +1657,303 @@ def subharm_octave(dev, profile, chk):
         chk.note(f"subharm: {SUBHARM_TONE:g}Hz in, {sub:g}Hz sub rose {rise:.1f} dB")
     finally:
         dev.set_u8(OP.SET_SUBHARM, 0); dev.wait_ready()
+
+
+# Every subharm scalar a test below may move, saved and restored wholesale so
+# each test only has to state what it needs.
+_SUBHARM_F32 = ((OP.SET_SUBHARM_LOW, OP.GET_SUBHARM_LOW),
+                (OP.SET_SUBHARM_HIGH, OP.GET_SUBHARM_HIGH),
+                (OP.SET_SUBHARM_TOP, OP.GET_SUBHARM_TOP),
+                (OP.SET_SUBHARM_BOOST, OP.GET_SUBHARM_BOOST),
+                (OP.SET_SUBHARM_CEILING, OP.GET_SUBHARM_CEILING),
+                (OP.SET_SUBHARM_DEPTH, OP.GET_SUBHARM_DEPTH),
+                (OP.SET_SUBHARM_HOLD, OP.GET_SUBHARM_HOLD))
+_SUBHARM_U8 = ((OP.SET_SUBHARM, OP.GET_SUBHARM),
+               (OP.SET_SUBHARM_SELECT, OP.GET_SUBHARM_SELECT),
+               (OP.SET_SUBHARM_LINK, OP.GET_SUBHARM_LINK))
+
+
+def _subharm_save(dev):
+    return ([(s, dev.get_f32(g)) for s, g in _SUBHARM_F32],
+            [(s, dev.get_u8(g)) for s, g in _SUBHARM_U8],
+            dev.get_u16(OP.GET_SUBHARM_MASK))
+
+
+def _subharm_restore(dev, saved):
+    """Undo a _subharm_setup().  Solo is forced off rather than restored: it is
+    runtime-only monitoring that must never survive into the next test."""
+    f32, u8, mask = saved
+    dev.set_u8(OP.SET_SUBHARM_SOLO, 0)
+    for op, val in f32:
+        dev.set_f32(op, val)
+    dev.set(OP.SET_SUBHARM_MASK, struct.pack("<H", mask))
+    for op, val in u8:
+        dev.set_u8(op, val)
+    dev.wait_ready()
+
+
+def _subharm_setup(dev, out_mask, low=0.0, high=SUBHARM_LEVEL_OFF_DB,
+                   top=SUBHARM_LEVEL_OFF_DB, ceiling=0.0, select=0, depth=100.0,
+                   hold=SUBHARM_SELECT_HOLD_MS, link=1, solo=0, enable=1):
+    """Write every subharm field, so nothing is inherited from the live preset.
+
+    The LF boost is always 0: solo bypasses the boost bell, so a solo on/off
+    comparison would not be like-for-like with it running.
+    """
+    dev.set_f32(OP.SET_SUBHARM_LOW, low)
+    dev.set_f32(OP.SET_SUBHARM_HIGH, high)
+    dev.set_f32(OP.SET_SUBHARM_TOP, top)
+    dev.set_f32(OP.SET_SUBHARM_BOOST, 0.0)
+    dev.set_f32(OP.SET_SUBHARM_CEILING, ceiling)
+    dev.set_f32(OP.SET_SUBHARM_DEPTH, depth)
+    dev.set_f32(OP.SET_SUBHARM_HOLD, hold)
+    dev.set_u8(OP.SET_SUBHARM_SELECT, select)
+    dev.set_u8(OP.SET_SUBHARM_LINK, link)
+    dev.set_u8(OP.SET_SUBHARM_SOLO, solo)
+    dev.set(OP.SET_SUBHARM_MASK, struct.pack("<H", out_mask))
+    dev.set_u8(OP.SET_SUBHARM, enable)
+    dev.wait_ready()
+
+
+def _subharm_bins(dev, rig, tone, probes, dur_s=0.8, amp=0.4):
+    return _capture(dev, lambda: audio.measure_tone_bins(
+        rig["out"], rig["in"], rig["chan"], rig["fs"], tone, probes,
+        dur_s=dur_s, amp=amp))
+
+
+@test("audio", mutating=True)
+def subharm_top_band(dev, profile, chk):
+    """The third band divides 112-160 Hz program; at its floor nothing is made."""
+    rig = _get_rig(dev, profile)
+    out_l = _slot_indices(profile, rig["slot"])[0]
+    sub = SUBHARM_TOP_TONE / 2.0
+    probes = (sub, SUBHARM_TOP_TONE)
+    saved = _subharm_save(dev)
+    try:
+        _flatten_chain(dev, rig["ch_l"])
+        # Enabled with all three bands at the floor: the stage runs but skips
+        # every divider, which is a stronger "no sub" case than disabling it.
+        _subharm_setup(dev, 1 << out_l, low=SUBHARM_LEVEL_OFF_DB)
+        off = _subharm_bins(dev, rig, SUBHARM_TOP_TONE, probes)
+        _subharm_setup(dev, 1 << out_l, low=SUBHARM_LEVEL_OFF_DB, top=0.0)
+        on = _subharm_bins(dev, rig, SUBHARM_TOP_TONE, probes)
+        chk.ok(off[sub] < off[SUBHARM_TOP_TONE] - 40.0,
+               f"all bands at the floor synthesize nothing "
+               f"({sub:g}Hz {off[sub]:.1f} vs tone {off[SUBHARM_TOP_TONE]:.1f} dBFS)")
+        rise = on[sub] - off[sub]
+        chk.ok(rise > SUBHARM_MIN_RISE_DB,
+               f"third band generates the sub ({sub:g}Hz {off[sub]:.1f} -> {on[sub]:.1f} dBFS)")
+        chk.ok(abs(on[SUBHARM_TOP_TONE] - off[SUBHARM_TOP_TONE]) < 1.0,
+               f"program tone untouched ({off[SUBHARM_TOP_TONE]:.1f} -> "
+               f"{on[SUBHARM_TOP_TONE]:.1f} dBFS)")
+        chk.note(f"subharm top: {SUBHARM_TOP_TONE:g}Hz in, {sub:g}Hz sub rose {rise:.1f} dB")
+    finally:
+        _subharm_restore(dev, saved)
+
+
+@test("audio", mutating=True)
+def subharm_solo(dev, profile, chk):
+    """Solo leaves the masked output carrying the synthesized sub and nothing else."""
+    rig = _get_rig(dev, profile)
+    out_l = _slot_indices(profile, rig["slot"])[0]
+    sub = SUBHARM_TONE / 2.0
+    probes = (sub, SUBHARM_TONE)
+    saved = _subharm_save(dev)
+
+    def bins():
+        # Envelope alignment in BOTH captures: with solo on there is nothing at
+        # SUBHARM_TONE left to correlate the window against, and using one
+        # alignment for the pair keeps any window bias common to the two.
+        res, strength = _capture(dev, lambda: audio.measure_tone_bins_2ch(
+            rig["out"], rig["in"], rig["fs"], SUBHARM_TONE, probes,
+            dur_s=SUBHARM_SOLO_TONE_S, envelope_align=True))
+        return res[0], strength
+
+    try:
+        _flatten_chain(dev, rig["ch_l"])
+        _subharm_setup(dev, 1 << out_l, solo=0)
+        off, st_off = bins()
+        dev.set_u8(OP.SET_SUBHARM_SOLO, 1); dev.wait_ready()
+        on, st_on = bins()
+        if min(st_off, st_on) < CORR_MIN:
+            raise Skip(f"envelope alignment never locked "
+                       f"(strength {st_off:.2f} / {st_on:.2f})")
+        drop = off[SUBHARM_TONE] - on[SUBHARM_TONE]
+        chk.ok(drop > SUBHARM_SOLO_DROP_DB,
+               f"dry tone removed under solo ({off[SUBHARM_TONE]:.1f} -> "
+               f"{on[SUBHARM_TONE]:.1f} dBFS, {drop:.1f} dB down)")
+        chk.approx(on[sub], off[sub], 1.0,
+                   f"sub level unchanged by solo ({off[sub]:.1f} -> {on[sub]:.1f} dBFS)")
+        chk.note(f"subharm solo: dry -{drop:.1f} dB, sub {on[sub]:.1f} dBFS")
+    finally:
+        dev.set_u8(OP.SET_SUBHARM_SOLO, 0)
+        _subharm_restore(dev, saved)
+
+
+@test("audio", mutating=True)
+def subharm_ceiling(dev, profile, chk):
+    """The sub ceiling pins the synthesized sub to its set dBFS."""
+    rig = _get_rig(dev, profile)
+    out_l = _slot_indices(profile, rig["slot"])[0]
+    sub = SUBHARM_TONE / 2.0
+    probes = (sub, SUBHARM_TONE)
+    lower = SUBHARM_CEILING_DBFS - 10.0
+    saved = _subharm_save(dev)
+    try:
+        _flatten_chain(dev, rig["ch_l"])
+        # Measured WITHOUT solo: the ceiling only touches the sub, and leaving
+        # the dry tone in place keeps waveform alignment (and its own bin)
+        # available.  A hot drive puts the uncapped sub well above both ceilings.
+        _subharm_setup(dev, 1 << out_l, ceiling=SUBHARM_CEILING_DBFS)
+        hi = _subharm_bins(dev, rig, SUBHARM_TONE, probes, amp=SUBHARM_HOT_AMP)
+        dev.set_f32(OP.SET_SUBHARM_CEILING, lower); dev.wait_ready()
+        lo = _subharm_bins(dev, rig, SUBHARM_TONE, probes, amp=SUBHARM_HOT_AMP)
+        chk.approx(hi[sub], SUBHARM_CEILING_BIN_DBFS, SUBHARM_CEILING_TOL_DB,
+                   f"ceiling {SUBHARM_CEILING_DBFS:g} dBFS holds the sub at {hi[sub]:.1f} dBFS")
+        chk.approx(hi[sub] - lo[sub], 10.0, 1.5,
+                   f"ceiling {lower:g} dBFS drops it 10 dB further "
+                   f"({hi[sub]:.1f} -> {lo[sub]:.1f} dBFS)")
+        chk.ok(abs(hi[SUBHARM_TONE] - lo[SUBHARM_TONE]) < 1.0,
+               f"dry tone untouched by the ceiling ({hi[SUBHARM_TONE]:.1f} vs "
+               f"{lo[SUBHARM_TONE]:.1f} dBFS)")
+        chk.note(f"subharm ceiling: {SUBHARM_CEILING_DBFS:g} -> {hi[sub]:.1f} dBFS, "
+                 f"{lower:g} -> {lo[sub]:.1f} dBFS")
+    finally:
+        _subharm_restore(dev, saved)
+
+
+@test("audio", mutating=True)
+def subharm_selectivity(dev, profile, chk):
+    """Percussive gates a sustained tone away; sustained keeps it."""
+    rig = _get_rig(dev, profile)
+    out_l = _slot_indices(profile, rig["slot"])[0]
+    sub = SUBHARM_TONE / 2.0
+    probes = (sub, SUBHARM_TONE)
+    saved = _subharm_save(dev)
+
+    def sub_level(mode):
+        _subharm_setup(dev, 1 << out_l, select=mode, depth=100.0)
+        # A tone this long puts the whole 30-95% measurement window past the
+        # hold and the 100 ms gate-close slew, so only the settled gate is read.
+        return _subharm_bins(dev, rig, SUBHARM_TONE, probes,
+                             dur_s=SUBHARM_SELECT_TONE_S)[sub]
+
+    try:
+        _flatten_chain(dev, rig["ch_l"])
+        every = sub_level(0)
+        percussive = sub_level(1)
+        sustained = sub_level(2)
+        chk.ok(every - percussive > SUBHARM_SELECT_DROP_DB,
+               f"percussive gates a held tone ({every:.1f} -> {percussive:.1f} dBFS)")
+        chk.approx(sustained, every, SUBHARM_SELECT_KEEP_TOL_DB,
+                   f"sustained keeps a held tone ({every:.1f} -> {sustained:.1f} dBFS)")
+        chk.note(f"subharm select: all {every:.1f}, percussive {percussive:.1f}, "
+                 f"sustained {sustained:.1f} dBFS")
+    finally:
+        _subharm_restore(dev, saved)
+
+
+@test("audio", mutating=True)
+def subharm_link_pair(dev, profile, chk):
+    """Linked pairs synthesize from the mono sum; unlinked, per output."""
+    rig = _get_rig(dev, profile)
+    out_l, out_r = _slot_indices(profile, rig["slot"])[:2]
+    sub = SUBHARM_TONE / 2.0
+    probes = (sub, SUBHARM_TONE)
+    pair_mask = (1 << out_l) | (1 << out_r)
+    saved = _subharm_save(dev)
+
+    def sub_level(right_scale):
+        res, strength = _capture(dev, lambda: audio.measure_tone_bins_2ch(
+            rig["out"], rig["in"], rig["fs"], SUBHARM_TONE, probes,
+            right_scale=right_scale))
+        if strength < CORR_MIN:
+            raise Skip(f"capture never locked onto the tone (strength {strength:.2f})")
+        return res[0][sub]
+
+    try:
+        _flatten_chain(dev, rig["ch_l"])
+        _flatten_chain(dev, rig["ch_r"])
+        # Both outputs must be masked, or the pass never pairs them.
+        _subharm_setup(dev, pair_mask, link=1)
+        in_phase = sub_level(1.0)
+        anti = sub_level(-1.0)
+        dev.set_u8(OP.SET_SUBHARM_LINK, 0); dev.wait_ready()
+        unlinked = sub_level(-1.0)
+        chk.ok(in_phase - anti > SUBHARM_MIN_RISE_DB,
+               f"linked: anti-phase pair sums to silence, no sub "
+               f"({in_phase:.1f} -> {anti:.1f} dBFS)")
+        chk.approx(unlinked, in_phase, 1.5,
+                   f"unlinked: output 0 keeps its own sub ({unlinked:.1f} vs "
+                   f"{in_phase:.1f} dBFS)")
+        chk.note(f"subharm link: in-phase {in_phase:.1f}, anti-phase linked {anti:.1f}, "
+                 f"anti-phase unlinked {unlinked:.1f} dBFS")
+    finally:
+        _subharm_restore(dev, saved)
+
+
+def _siggen_sine(dev, mask, freq, level_db):
+    """Hold a continuous sine on `mask` (non-RAW, so it still feeds subharm).
+
+    The loopback capture is synchronous, so a captured tone is long over by the
+    time the host can read a live meter; a held generator tone is not.
+    """
+    dev.set(OP.SIGGEN_SET_CONFIG,
+            struct.pack("<BBHHBBfIHHffff", SIGGEN_CFG_VERSION, SIGGEN_SINE, mask,
+                        0, 0, 0, level_db, 0, 0, 0, freq, 0.0, 0.0, 0.0))
+    dev.get_u8(OP.SIGGEN_CONTROL, wvalue=SIGGEN_CTL_START)
+    dev.wait_ready()
+
+
+def _subharm_meter(dev, profile, out):
+    """(raw uint16, dBFS) of one output's sub peak; 32767 is full scale."""
+    n = profile.num_output_channels
+    peaks = struct.unpack(f"<{n}H", dev.get(OP.GET_SUBHARM_METER, 2 * n))
+    return peaks[out], 20.0 * np.log10(max(peaks[out], 1) / 32767.0)
+
+
+@test("audio", mutating=True)
+def subharm_meter(dev, profile, chk):
+    """The sub meter reads the synthesized sub's peak, and clears when off."""
+    rig = _get_rig(dev, profile)
+    out_l = _slot_indices(profile, rig["slot"])[0]
+    saved = _subharm_save(dev)
+    try:
+        _flatten_chain(dev, rig["ch_l"])
+        _subharm_setup(dev, 1 << out_l)
+        try:
+            _siggen_sine(dev, 1 << out_l, SUBHARM_TONE, SUBHARM_METER_DRIVE_HI_DB)
+        except Stall as e:
+            raise Skip(f"onboard signal generator unavailable: {e}")
+        time.sleep(SUBHARM_METER_SETTLE_S)
+        raw_hi, hi = _subharm_meter(dev, profile, out_l)
+        chk.ok(raw_hi > 0, f"meter reads the running sub (raw {raw_hi}, {hi:.1f} dBFS)")
+        chk.approx(hi - SUBHARM_METER_DRIVE_HI_DB, SUBHARM_METER_DRIVE_DB,
+                   SUBHARM_METER_TOL_DB,
+                   f"meter tracks the sub level ({hi:.1f} dBFS from a "
+                   f"{SUBHARM_METER_DRIVE_HI_DB:g} dBFS drive)")
+        _siggen_sine(dev, 1 << out_l, SUBHARM_TONE, SUBHARM_METER_DRIVE_LO_DB)
+        time.sleep(SUBHARM_METER_SETTLE_S)
+        _raw_lo, lo = _subharm_meter(dev, profile, out_l)
+        chk.approx(hi - lo, SUBHARM_METER_DRIVE_HI_DB - SUBHARM_METER_DRIVE_LO_DB, 2.0,
+                   f"meter follows a 12 dB drive change ({hi:.1f} -> {lo:.1f} dBFS)")
+        # The ceiling pins the sub's peak to a known dBFS, which checks the
+        # meter's absolute scale without leaning on a band-filter model.
+        _siggen_sine(dev, 1 << out_l, SUBHARM_TONE, SUBHARM_METER_DRIVE_HI_DB)
+        dev.set_f32(OP.SET_SUBHARM_CEILING, SUBHARM_CEILING_DBFS); dev.wait_ready()
+        time.sleep(SUBHARM_METER_SETTLE_S)
+        _raw_c, capped = _subharm_meter(dev, profile, out_l)
+        chk.approx(capped, SUBHARM_CEILING_DBFS, 2.0,
+                   f"meter matches the {SUBHARM_CEILING_DBFS:g} dBFS ceiling "
+                   f"({capped:.1f} dBFS)")
+        dev.set_u8(OP.SET_SUBHARM, 0); dev.wait_ready()
+        time.sleep(1.0)                     # 300 ms meter tau, plus slack
+        raw_off, _off = _subharm_meter(dev, profile, out_l)
+        chk.eq(raw_off, 0, "meter clears within a second of disabling the effect")
+        chk.note(f"subharm meter: raw {raw_hi} = {hi:.1f} dBFS, capped {capped:.1f} dBFS")
+    finally:
+        _optional(lambda: dev.get_u8(OP.SIGGEN_CONTROL, wvalue=SIGGEN_CTL_STOP_NOW))
+        _subharm_restore(dev, saved)
 
 
 # --- Per-rate replay --------------------------------------------------------

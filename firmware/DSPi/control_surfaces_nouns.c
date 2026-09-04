@@ -100,6 +100,10 @@ extern volatile bool sync_started;
 // value fields top out at 127.99, so the front-panel span stops there.
 #define CS_LOUDNESS_INTENSITY_MAX  127.0f
 
+// Same 8.8 ceiling caps the subharm selectivity hold: the command accepts up
+// to SUBHARM_HOLD_MAX (400 ms), the front panel reaches 127 ms.
+#define CS_SUBHARM_HOLD_MAX_MS     127.0f
+
 // Q(8.8) helper for table literals; rounds to nearest (a plain cast would
 // truncate, encoding Q 0.1 as 25 instead of the documented 26).  Must stay a
 // constant expression: the table below is a static initializer.
@@ -233,6 +237,25 @@ const CsNounDesc cs_noun_table[CS_NOUN_COUNT] = {
     [CS_NOUN_SUBHARM_BOOST]   = { CS_KIND_CONTINUOUS, 0, CS_CONT_RW,
                                   Q8(SUBHARM_BOOST_MIN), Q8(SUBHARM_BOOST_MAX),
                                   CS_UNIT_DB, CS_TARGET_NONE, 0, 0 },
+    [CS_NOUN_SUBHARM_TOP]     = { CS_KIND_CONTINUOUS, 0, CS_CONT_RW,
+                                  Q8(SUBHARM_LEVEL_MIN), Q8(SUBHARM_LEVEL_MAX),
+                                  CS_UNIT_DB, CS_TARGET_NONE, 0, 0 },
+    [CS_NOUN_SUBHARM_SELECT]  = { CS_KIND_ENUM, SUBHARM_SELECT_MODE_MAX + 1,
+                                  CS_ENUM_RW, 0, 0,
+                                  CS_UNIT_NONE, CS_TARGET_NONE, 0, 0 },
+    [CS_NOUN_SUBHARM_DEPTH]   = { CS_KIND_CONTINUOUS, 0, CS_CONT_RW,
+                                  Q8(SUBHARM_DEPTH_MIN), Q8(SUBHARM_DEPTH_MAX),
+                                  CS_UNIT_PERCENT, CS_TARGET_NONE, 0, 0 },
+    [CS_NOUN_SUBHARM_HOLD]    = { CS_KIND_CONTINUOUS, 0, CS_CONT_RW,
+                                  Q8(SUBHARM_HOLD_MIN), Q8(CS_SUBHARM_HOLD_MAX_MS),
+                                  CS_UNIT_MS, CS_TARGET_NONE, 0, 0 },
+    [CS_NOUN_SUBHARM_CEILING] = { CS_KIND_CONTINUOUS, 0, CS_CONT_RW,
+                                  Q8(SUBHARM_CEILING_MIN), Q8(SUBHARM_CEILING_MAX),
+                                  CS_UNIT_DB, CS_TARGET_NONE, 0, 0 },
+    [CS_NOUN_SUBHARM_LINK]    = { CS_KIND_BOOL, 0, CS_BOOL_RW, 0, 0,
+                                  CS_UNIT_NONE, CS_TARGET_NONE, 0, 0 },
+    [CS_NOUN_SUBHARM_SOLO]    = { CS_KIND_BOOL, 0, CS_BOOL_RW, 0, 0,
+                                  CS_UNIT_NONE, CS_TARGET_NONE, 0, 0 },
     [CS_NOUN_OUTPUT_DELAY]    = { CS_KIND_CONTINUOUS, 0, CS_CONT_RW,
                                   0, CS_DELAY_MAX_MS_Q8, CS_UNIT_MS,
                                   CS_TARGET_OUTPUT_CH, NUM_OUTPUT_CHANNELS, 0 },
@@ -429,6 +452,13 @@ float cs_noun_get(uint8_t noun, uint8_t target, uint8_t index) {
         case CS_NOUN_SUBHARM_LOW:       return subharm_config.low_db;
         case CS_NOUN_SUBHARM_HIGH:      return subharm_config.high_db;
         case CS_NOUN_SUBHARM_BOOST:     return subharm_config.boost_db;
+        case CS_NOUN_SUBHARM_TOP:       return subharm_config.top_db;
+        case CS_NOUN_SUBHARM_SELECT:    return (float)subharm_config.select_mode;
+        case CS_NOUN_SUBHARM_DEPTH:     return subharm_config.select_depth;
+        case CS_NOUN_SUBHARM_HOLD:      return subharm_config.select_hold_ms;
+        case CS_NOUN_SUBHARM_CEILING:   return subharm_config.ceiling_db;
+        case CS_NOUN_SUBHARM_LINK:      return subharm_config.link_pairs ? 1.0f : 0.0f;
+        case CS_NOUN_SUBHARM_SOLO:      return subharm_config.solo ? 1.0f : 0.0f;
         case CS_NOUN_OUTPUT_DELAY:      return matrix_mixer.outputs[target].delay_ms;
         case CS_NOUN_PRESET_RELOAD:     return 0.0f;
         // Both read live: the SET handler stores the value immediately and
@@ -498,10 +528,17 @@ bool cs_noun_dispatch(uint8_t noun, uint8_t target, uint8_t index, float value) 
         }
         case CS_NOUN_SUBHARM_LOW:
         case CS_NOUN_SUBHARM_HIGH:
-        case CS_NOUN_SUBHARM_BOOST: {
-            // Per-parameter float SETs; nouns are contiguous from LOW.
+        case CS_NOUN_SUBHARM_BOOST:
+        case CS_NOUN_SUBHARM_TOP:
+        case CS_NOUN_SUBHARM_DEPTH:
+        case CS_NOUN_SUBHARM_HOLD:
+        case CS_NOUN_SUBHARM_CEILING: {
+            // Per-parameter float SETs, indexed from LOW.  The 0 hole is
+            // CS_NOUN_SUBHARM_SELECT, a one-byte enum handled in the default arm.
             static const uint8_t subharm_req[] = {
                 REQ_SET_SUBHARM_LOW, REQ_SET_SUBHARM_HIGH, REQ_SET_SUBHARM_BOOST,
+                REQ_SET_SUBHARM_TOP, 0, REQ_SET_SUBHARM_DEPTH,
+                REQ_SET_SUBHARM_HOLD, REQ_SET_SUBHARM_CEILING,
             };
             float f = value;
             r = vendor_dispatch_set(CTRL_SOURCE_GPIO,
@@ -612,6 +649,9 @@ bool cs_noun_dispatch(uint8_t noun, uint8_t target, uint8_t index, float value) 
                 case CS_NOUN_LEVELLER_LOOKAHEAD: req = REQ_SET_LEVELLER_LOOKAHEAD; break;
                 case CS_NOUN_PSYBASS:          req = REQ_SET_PSYBASS;            break;
                 case CS_NOUN_SUBHARM:          req = REQ_SET_SUBHARM;            break;
+                case CS_NOUN_SUBHARM_SELECT:   req = REQ_SET_SUBHARM_SELECT;     break;
+                case CS_NOUN_SUBHARM_LINK:     req = REQ_SET_SUBHARM_LINK;       break;
+                case CS_NOUN_SUBHARM_SOLO:     req = REQ_SET_SUBHARM_SOLO;       break;
                 default:                       return true;   // read-only noun
             }
             r = vendor_dispatch_set(CTRL_SOURCE_GPIO, req, 0, 0, &v, 1);

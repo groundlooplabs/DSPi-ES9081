@@ -183,7 +183,12 @@
 //        tail-append like V22..V35: V21..V35 slots still load via
 //        slot_data_size_for_version; older slots have no subharm data and load
 //        the disabled/all-outputs defaults (apply is gated on version >= 36).
-#define SLOT_DATA_VERSION       36
+//   V37: Subharmonic synthesizer third band, selectivity, ceiling and pair link
+//        appended (four floats + mode + link + two reserved; struct grows by 20
+//        bytes).  Backward-compatible tail-append like V22..V36: V21..V36 slots
+//        still load via slot_data_size_for_version and take the SUBHARM_DEFAULT_*
+//        values for the new fields (apply is gated on version >= 37).
+#define SLOT_DATA_VERSION       37
 
 // ============================================================================
 // ON-FLASH STRUCTURES
@@ -1314,6 +1319,17 @@ typedef struct __attribute__((packed)) {
     float    subharm_low_db;
     float    subharm_high_db;
     float    subharm_boost_db;
+
+    // V37: subharm third band, selectivity, sub ceiling and pair link.  Gated
+    // on version >= 37 in apply_slot_to_live().  `solo` is runtime-only and
+    // deliberately absent, so no stored slot can boot into monitoring mode.
+    float    subharm_top_db;
+    float    subharm_select_depth;
+    float    subharm_select_hold_ms;
+    float    subharm_ceiling_db;
+    uint8_t  subharm_select_mode;
+    uint8_t  subharm_link_pairs;
+    uint8_t  subharm_reserved2[2];
 } PresetSlot;
 
 // The whole slot must fit its 2-sector (8 KB) flash allocation.
@@ -3249,6 +3265,15 @@ static void collect_live_state(PresetSlot *slot, uint8_t slot_index) {
     slot->subharm_low_db      = subharm_config.low_db;
     slot->subharm_high_db     = subharm_config.high_db;
     slot->subharm_boost_db    = subharm_config.boost_db;
+    // V37 tail; `solo` is runtime-only and never stored.
+    slot->subharm_top_db         = subharm_config.top_db;
+    slot->subharm_select_depth   = subharm_config.select_depth;
+    slot->subharm_select_hold_ms = subharm_config.select_hold_ms;
+    slot->subharm_ceiling_db     = subharm_config.ceiling_db;
+    slot->subharm_select_mode    = subharm_config.select_mode;
+    slot->subharm_link_pairs     = subharm_config.link_pairs ? 1 : 0;
+    slot->subharm_reserved2[0]   = 0;
+    slot->subharm_reserved2[1]   = 0;
 
     // ADAT input (V32): raw pin (0xFF unset) + enable + clock mode (both
     // platforms; RP2040 stores its default state for round-trips).
@@ -3531,6 +3556,24 @@ static void apply_slot_to_live(const PresetSlot *slot) {
         subharm_config.high_db     = SUBHARM_DEFAULT_HIGH;
         subharm_config.boost_db    = SUBHARM_DEFAULT_BOOST;
     }
+    // V37 tail; V36 slots predate these fields and take the defaults.  `solo`
+    // is runtime-only, so a preset load never changes it.
+    if (slot->version >= 37) {
+        subharm_config.top_db         = slot->subharm_top_db;
+        subharm_config.select_depth   = slot->subharm_select_depth;
+        subharm_config.select_hold_ms = slot->subharm_select_hold_ms;
+        subharm_config.ceiling_db     = slot->subharm_ceiling_db;
+        subharm_config.select_mode    = (slot->subharm_select_mode > SUBHARM_SELECT_MODE_MAX)
+                                        ? SUBHARM_SELECT_MODE_MAX : slot->subharm_select_mode;
+        subharm_config.link_pairs     = (slot->subharm_link_pairs != 0);
+    } else {
+        subharm_config.top_db         = SUBHARM_DEFAULT_TOP;
+        subharm_config.select_depth   = SUBHARM_DEFAULT_DEPTH;
+        subharm_config.select_hold_ms = SUBHARM_DEFAULT_HOLD_MS;
+        subharm_config.ceiling_db     = SUBHARM_DEFAULT_CEILING;
+        subharm_config.select_mode    = SUBHARM_DEFAULT_SELECT_MODE;
+        subharm_config.link_pairs     = SUBHARM_DEFAULT_LINK_PAIRS;
+    }
     subharm_update_pending = true;
 
     // Stereo upmixer (V33): RP2350-only.  V33+ slots restore the stored config
@@ -3740,7 +3783,8 @@ static void apply_slot_to_live(const PresetSlot *slot) {
 // appended i2s_clock_mode; V29 appended i2s_clock_pin_mode + i2s_bck_pin_slave;
 // V30 appended peq_qp_x512; V31 appended psybass; V32 appended the ADAT input
 // fields; V33 appended the stereo upmixer config; V35 appended the SPDIF input
-// 4 pin; V36 appended the subharmonic synthesizer config, so each version's
+// 4 pin; V36 appended the subharmonic synthesizer config; V37 appended the
+// subharm third band / selectivity / ceiling / link, so each version's
 // range stops where the next version's fields begin
 // (a stored slot's CRC was computed without the fields its version predates).
 #define SLOT_DATA_SIZE_V21 \
@@ -3774,6 +3818,8 @@ static void apply_slot_to_live(const PresetSlot *slot) {
 #define SLOT_DATA_SIZE_V35 \
     (offsetof(PresetSlot, subharm_enabled) - offsetof(PresetSlot, filter_recipes))
 #define SLOT_DATA_SIZE_V36 \
+    (offsetof(PresetSlot, subharm_top_db) - offsetof(PresetSlot, filter_recipes))
+#define SLOT_DATA_SIZE_V37 \
     (sizeof(PresetSlot) - offsetof(PresetSlot, filter_recipes))
 
 // V21 broke compatibility (unified channel model); V22 (I2S multichannel input),
@@ -3781,14 +3827,17 @@ static void apply_slot_to_live(const PresetSlot *slot) {
 // masks), V26 (loudness output mask), V27 (crossfeed output pair mask), V28
 // (I2S clock master/slave mode), V29 (I2S clock-pin mode), V30 (Linkwitz
 // Transform per-band target Q), V31 (psychoacoustic bass), V32 (ADAT input) and
-// V33 (stereo upmixer) and V35 (SPDIF input 4 pin) are backward-compatible
-// tail-appends; V34 (upmix presence) claims a reserved byte with no size
-// change.  V21..V35 slots are all accepted (an older slot loads with the newer
-// fields defaulted to unset) while older/unknown versions are invalidated and
-// the slot loads factory defaults.
+// V33 (stereo upmixer), V35 (SPDIF input 4 pin), V36 (subharmonic synthesizer)
+// and V37 (subharm third band / selectivity / ceiling / link) are
+// backward-compatible tail-appends; V34 (upmix presence) claims a reserved byte
+// with no size change.  V21..V36 slots are all accepted (an older slot loads
+// with the newer fields defaulted to unset) while older/unknown versions are
+// invalidated and the slot loads factory defaults.
 static size_t slot_data_size_for_version(uint8_t version) {
     switch (version) {
-        case SLOT_DATA_VERSION:   // 36
+        case SLOT_DATA_VERSION:   // 37
+            return SLOT_DATA_SIZE_V37;
+        case 36:
             return SLOT_DATA_SIZE_V36;
         case 35:
             return SLOT_DATA_SIZE_V35;
@@ -4416,6 +4465,15 @@ static void apply_factory_defaults(void) {
     subharm_config.low_db      = SUBHARM_DEFAULT_LOW;
     subharm_config.high_db     = SUBHARM_DEFAULT_HIGH;
     subharm_config.boost_db    = SUBHARM_DEFAULT_BOOST;
+    subharm_config.top_db         = SUBHARM_DEFAULT_TOP;
+    subharm_config.select_depth   = SUBHARM_DEFAULT_DEPTH;
+    subharm_config.select_hold_ms = SUBHARM_DEFAULT_HOLD_MS;
+    subharm_config.ceiling_db     = SUBHARM_DEFAULT_CEILING;
+    subharm_config.select_mode    = SUBHARM_DEFAULT_SELECT_MODE;
+    subharm_config.link_pairs     = SUBHARM_DEFAULT_LINK_PAIRS;
+    // The one place solo is written outside its own vendor SET: a factory reset
+    // must not leave the device monitoring the sub only.
+    subharm_config.solo           = false;
     subharm_update_pending = true;
 
     // Stereo upmixer (RP2350-only): disabled, default engine params.

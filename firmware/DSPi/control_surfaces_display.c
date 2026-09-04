@@ -24,6 +24,7 @@
 #include "crossfeed.h"
 #include "leveller.h"
 #include "upmix.h"
+#include "subharm.h"
 
 #include "hardware/i2c.h"
 #include "hardware/gpio.h"
@@ -582,7 +583,10 @@ static const char *const s_noun_label[CS_NOUN_COUNT] = {
     [CS_NOUN_DISPLAY_PAGE] = "Page",       [CS_NOUN_DISPLAY_EDIT] = "Edit",
     [CS_NOUN_PAGE_VALUE] = "Value",       [CS_NOUN_SUBHARM] = "Subharm",
     [CS_NOUN_SUBHARM_LOW] = "Sub 24-36",  [CS_NOUN_SUBHARM_HIGH] = "Sub 36-56",
-    [CS_NOUN_SUBHARM_BOOST] = "LF Boost",
+    [CS_NOUN_SUBHARM_BOOST] = "LF Boost",  [CS_NOUN_SUBHARM_TOP] = "Sub 56-80",
+    [CS_NOUN_SUBHARM_SELECT] = "Sub Select",[CS_NOUN_SUBHARM_DEPTH] = "Sub Depth",
+    [CS_NOUN_SUBHARM_HOLD] = "Sub Hold",   [CS_NOUN_SUBHARM_CEILING] = "Sub Ceil",
+    [CS_NOUN_SUBHARM_LINK] = "Sub Link",   [CS_NOUN_SUBHARM_SOLO] = "Sub Solo",
 };
 
 static const char *const s_input_label[] = {"USB", "SPDIF", "I2S", "ADAT",
@@ -590,6 +594,7 @@ static const char *const s_input_label[] = {"USB", "SPDIF", "I2S", "ADAT",
 static const char *const s_rate_label[]  = {"44.1 kHz", "48 kHz", "96 kHz"};
 static const char *const s_xf_preset_label[] = {"Default", "Chu Moy", "Meier", "Custom"};
 static const char *const s_lev_speed_label[] = {"Slow", "Medium", "Fast"};
+static const char *const s_subharm_select_label[] = {"All", "Percussive", "Sustained"};
 static const char *const s_center_mode_label[]   = {"Sinner", "Logician", "Off"};
 static const char *const s_surround_mode_label[] = {"Off", "Sinner", "Logician"};
 // Indexed by FilterType; includes the host-only types above the CS cycling
@@ -620,6 +625,8 @@ _Static_assert(DISP_N(s_xf_preset_label) == CROSSFEED_PRESET_CUSTOM + 1,
                "crossfeed preset names must cover the enum");
 _Static_assert(DISP_N(s_lev_speed_label) == LEVELLER_SPEED_COUNT,
                "leveller speed names must cover the enum");
+_Static_assert(DISP_N(s_subharm_select_label) == SUBHARM_SELECT_MODE_MAX + 1,
+               "subharm selectivity names must cover the enum");
 #if PICO_RP2350
 _Static_assert(DISP_N(s_center_mode_label) == UPMIX_CENTER_OFF + 1,
                "centre mode names must cover the enum");
@@ -639,6 +646,7 @@ static const char *disp_enum_label(uint8_t noun, int v, bool large) {
         case CS_NOUN_SAMPLE_RATE:         DISP_TAB(s_rate_label); break;
         case CS_NOUN_CROSSFEED_PRESET:    DISP_TAB(s_xf_preset_label); break;
         case CS_NOUN_LEVELLER_SPEED:      DISP_TAB(s_lev_speed_label); break;
+        case CS_NOUN_SUBHARM_SELECT:      DISP_TAB(s_subharm_select_label); break;
         case CS_NOUN_UPMIX_CENTER_MODE:   DISP_TAB(s_center_mode_label); break;
         case CS_NOUN_UPMIX_SURROUND_MODE: DISP_TAB(s_surround_mode_label); break;
         case CS_NOUN_FILTER_TYPE:

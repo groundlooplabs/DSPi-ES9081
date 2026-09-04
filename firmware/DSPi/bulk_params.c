@@ -52,11 +52,11 @@ _Static_assert(sizeof(WireUpmixParams) == 44, "V25 upmixer section must be 44 by
 // mid-struct edit that shifts them must bump WIRE_FORMAT_VERSION instead.
 _Static_assert(offsetof(WireBulkParams, upmix) == 5900,
                "V25 upmixer section must sit at wire offset 5900");
-_Static_assert(sizeof(WireSubharmParams) == 16, "V29 subharm section must be 16 bytes");
+_Static_assert(sizeof(WireSubharmParams) == 36, "V30 subharm section must be 36 bytes");
 _Static_assert(offsetof(WireBulkParams, subharm) == 5944,
                "V29 subharm section must sit at wire offset 5944");
-_Static_assert(sizeof(WireBulkParams) == 5960,
-               "V29 wire total must be 5960 bytes");
+_Static_assert(sizeof(WireBulkParams) == 5980,
+               "V30 wire total must be 5980 bytes");
 #if PICO_RP2350
 _Static_assert(sizeof(WireUpmixParams) == sizeof(UpmixConfigPacket),
                "WireUpmixParams and UpmixConfigPacket must have identical layout");
@@ -330,6 +330,14 @@ void bulk_params_collect(WireBulkParams *out) {
     out->subharm.low_db      = subharm_config.low_db;
     out->subharm.high_db     = subharm_config.high_db;
     out->subharm.boost_db    = subharm_config.boost_db;
+    out->subharm.top_db         = subharm_config.top_db;
+    out->subharm.select_depth   = subharm_config.select_depth;
+    out->subharm.select_hold_ms = subharm_config.select_hold_ms;
+    out->subharm.ceiling_db     = subharm_config.ceiling_db;
+    out->subharm.select_mode    = subharm_config.select_mode;
+    out->subharm.link_pairs     = subharm_config.link_pairs ? 1 : 0;
+    out->subharm.reserved1[0]   = 0;
+    out->subharm.reserved1[1]   = 0;
 
     // Stereo upmixer (V25+).  RP2350 only; the whole section (including reserved)
     // stays zeroed on RP2040 from the memset above.
@@ -927,6 +935,15 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
     subharm_config.low_db      = in->subharm.low_db;
     subharm_config.high_db     = in->subharm.high_db;
     subharm_config.boost_db    = in->subharm.boost_db;
+    // V30 tail.  select_mode is clamped here because the kernel indexes on it;
+    // solo is absent from the wire and left untouched by design.
+    subharm_config.top_db         = in->subharm.top_db;
+    subharm_config.select_depth   = in->subharm.select_depth;
+    subharm_config.select_hold_ms = in->subharm.select_hold_ms;
+    subharm_config.ceiling_db     = in->subharm.ceiling_db;
+    subharm_config.select_mode    = (in->subharm.select_mode > SUBHARM_SELECT_MODE_MAX)
+                                    ? SUBHARM_SELECT_MODE_MAX : in->subharm.select_mode;
+    subharm_config.link_pairs     = (in->subharm.link_pairs != 0);
     subharm_update_pending = true;
 
     // Stereo upmixer (V25+).  RP2350 only; RP2040 ignores the section.  Config

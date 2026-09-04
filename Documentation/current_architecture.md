@@ -1119,17 +1119,34 @@ Missing-fundamental bass enhancement for small speakers. A speaker that cannot p
 ### Signal Flow (per output channel, in place)
 
 ```
-low  = LP2(x)                          // 2nd-order lowpass split at cutoff (Butterworth, Q=0.707)
-even = |low|                           // full-wave rectifier: even harmonics, level-proportional
-odd  = softclip(drive * low)           // cubic soft clipper (1.5d - 0.5d^3): odd harmonics
-h    = (1 - t)*even + t*odd            // character blend t (0 = even/warm, 1 = odd/aggressive)
-h    = OP4fc(HP2(h))                   // HP2 at cutoff kills DC + fundamental; one-pole LP at 4x cutoff caps brightness
-out  = x + (g_orig - 1)*low + g_harm*h // original low band already split out, so its level control is free
+y      = LP2_160(x)                        // full rate: top of band 2 and the decimation anti-alias filter
+every D samples (D = round(fs/8000): 6 at 44.1/48k, 12 at 96k):
+  s      = HP2_48(y)
+  lo, b2 = LP/HP of SVF_112(s)             // band 2 = 112-160 Hz
+  b0, b1 = LP/HP of SVF_72(lo)             // band 0 = 48-72, band 1 = 72-112
+  d_b    = divider(b_b) * gate_b           // polarity flip once per cycle; optional selectivity weight
+  sub0   = LP2_40(d_0)
+  sub1   = AP1(LP2_62(d_1))                // 160 Hz with two bands, 105 Hz with three
+  sub2   = AP1_130(LP2_80(d_2))
+  sub    = ceiling(g_low*sub0 + g_high*sub1 + g_top*sub2);  meter = max(|sub|, meter*decay)
+out    = bell_70(x + interp(sub))          // linear interpolation back to full rate; solo: out = interp(sub)
 ```
 
-The full-wave rectified (even) path tracks program dynamics; the driven cubic (odd) path adds bite. Blending both yields the consecutive 2f/3f/4f series that pitches the missing fundamental. The harmonic highpass at the cutoff removes DC and the fundamental itself (leaving only the reproducible harmonics); the one-pole lowpass at `4 * cutoff` (`PSYBASS_HARM_LP_RATIO`) is a gentle 6 dB/oct rolloff mimicking natural harmonic decay. The original low band is split out separately, so `original_db` attenuates it independently (`orig_delta = 10^(orig/20) - 1`, range -1..0) without touching the rest of the signal.
+The divider is a peak follower (40 ms decay) plus a hysteresis comparator: it arms once the band dips below a quarter of its envelope and flips polarity at the next non-negative sample, so the divided waveform is continuous and beating partials or noise cannot re-trigger it inside one cycle. A band sine flipped every cycle carries 0.849 of its amplitude at f/2, 0.509 at 3f/2, 0.121 at 5f/2 and nothing at f; the post lowpass keeps f/2.
 
-**Zero added latency.** The effect is pure IIR (no delay lines, identical `sample_count` on every output), so inter-output-slot sample alignment is untouched by construction (the CLAUDE.md inviolable guarantee).
+**Why one divider per band.** Each band has its own divider so a kick in the lower band and a bass note in the upper band divide independently (offline model: spurious content -21 dB below the subs on a 55 + 100 Hz mixture). A single divider over the whole range loses lock on that mixture.
+
+**Why the allpasses and the parity slaving.** The dividers' flip-flops are left in an arbitrary relative state by the previous note. The SVF's LP and HP outputs are 180 degrees apart, which puts two adjacent subs in quadrature, so their sum is parity-independent once the post lowpasses' phase lags are matched: a first-order allpass on band 1 (160 Hz with two bands) and on band 2 (130 Hz) does that, and with three bands band 1's corner moves to 105 Hz. Bands 0 and 2 are not adjacent, so no allpass can hold them in quadrature, yet a 90 Hz note leaks into both at about -6 dB and left three free flip-flops the model showed up to 7 dB of history dependence. When bands 0 and 2 measure the same flip period (within 1/16) band 2's flip-flop takes its polarity from the sign of band 0's divided signal at the flip instant instead of toggling; a polarity set at a zero crossing is click-free, and different notes never match periods. Result, all eight parity states in the model: spread under 0.8 dB with two bands and under 1.1 dB with three, versus 4.7 and 7 dB without.
+
+**Why decimate.** Nothing below the bell has content above 160 Hz, so the split, dividers, gates and ceiling run at about 8 kHz behind the 160 Hz lowpass (folded content at least 68 dB down) and the sub is linearly interpolated back (images below -99 dB). The cost per sample roughly halves against the full-rate kernel even with the new stages on, and the RP2040 Q28 precision improves by about 13 dB because the filter corners sit six times higher relative to the rate. The sub lags the dry signal by one low-rate period (0.125 ms) identically on every processed output; the dry signal is not delayed.
+
+**Selectivity gate.** Per band, from the divider's own envelope: a 400 ms slow follower (30 ms rise) marks an attack when the fast envelope exceeds twice it; an attack or silence (below -60 dBFS) resets a hold counter. Percussive mode opens the gate at once and closes it over 100 ms once the counter passes the hold; sustained mode opens over 30 ms after the hold and shuts at once on an attack so a kick under a held note ducks. `depth` scales how far the gate closes. The weight multiplies the divided signal before the post lowpass, which smooths the steps. It cannot separate two sources sounding at once in one band (see the spec's edge cases).
+
+**Sub ceiling.** A peak follower on the sub sum (200 ms release) drives a gain of ceiling / peak whenever the peak exceeds the ceiling, slewed with a 3 ms attack and 200 ms release. Steady-state level sits at the ceiling with no added distortion; a loud onset overshoots by a few dB for a few milliseconds.
+
+**Linked pairs.** With `link_pairs` (default on) an S/PDIF pair whose two outputs are both eligible synthesizes one sub from the pair's mono sum and mixes it into both, each with its own bell. Independent per-channel dividers would otherwise be knocked into opposite polarity by any panned event, putting a centred bass note's sub out of phase between the speakers. The pair costs one kernel plus one bell.
+
+**Alignment and divider parity across outputs.** Pure IIR, no delay lines. The decimation phase comes from one absolute sample counter on Core 0 (`sh_sample_ctr`, handed to Core 1 as `Core1EqWork.subharm_phase`), so every processed output gets the identical one-period sub lag whatever its processing history, and inter-output-slot sample alignment is untouched by construction (the CLAUDE.md inviolable guarantee). A zero-crossing divider has no absolute phase reference, so an output whose state was reset (mute, mask, link toggle) must not restart its divider against a running neighbour: the pass seeds a fresh output from its running pair partner, and a linked pair mirrors its state into the odd output every block, so an unlink continues both in step. Verified on the host: unlinking at arbitrary packets leaves the two subs at correlation +1.000.
 
 ### Platform Implementation
 
@@ -1169,11 +1186,11 @@ Follows the loudness/crossfeed module pattern:
 ---
 
 ## Subharmonic Synthesizer
-*Last updated: 2026-09-02*
+*Last updated: 2026-09-04*
 
 ### Purpose
 
-A dbx 120A style octave divider. The effect listens to the program bass in 48 to 112 Hz, synthesizes a note exactly one octave below it (24 to 56 Hz) whose envelope follows the bass that produced it, and mixes it back in at a user-set level, with a gentle LF boost bell after the sum. It is the mirror image of psybass: psybass adds harmonics above the bass for speakers that cannot play the fundamental, subharm adds a real fundamental below the bass for systems that can. Both platforms. Full spec: `Documentation/Features/subharmonic_synth_spec.md`. Status: **HW-untested** (verified against an offline model of the kernel).
+A dbx 120A style octave divider, extended. The effect listens to the program bass in 48 to 160 Hz in three bands (the third off by default), synthesizes a note exactly one octave below it (24 to 80 Hz) whose envelope follows the bass that produced it, and mixes it back in at a user-set level, with a gentle LF boost bell after the sum. Since 2026-09-04 it also offers a percussive / sustained selectivity gate, a sub ceiling limiter, linked stereo pairs, a runtime solo and a per-output sub meter, and everything below the bell runs at a decimated rate. It is the mirror image of psybass: psybass adds harmonics above the bass for speakers that cannot play the fundamental, subharm adds a real fundamental below the bass for systems that can. Both platforms. Full spec: `Documentation/Features/subharmonic_synth_spec.md`. Status: **HW-untested** (verified against an offline model of the kernel).
 
 ### Signal Flow (per output channel, in place)
 
@@ -1196,12 +1213,12 @@ The divider is a peak follower (40 ms decay) plus a hysteresis comparator: it ar
 
 ### Platform Implementation
 
-The kernel exists once, in `subharm.h`, written against a number-type abstraction (`sh_num_t` with `sh_mul`, `sh_twice`, `sh_quarter`, `sh_abs`, `sh_band_limit`). Every filter is a TPT state-variable filter; the corners are far below Fs/7.5 at every rate, so the SVF form is both cheaper (three multiplies per stage once the lowpass update is folded to `v2 = ic2 + g v1`, with LP and HP for free) and more precise than a direct-form biquad.
+The kernel exists once, in `subharm.c`, written against a number-type abstraction in `subharm.h` (`sh_num_t` with `sh_mul`, `sh_half`, `sh_twice`, `sh_quarter`, `sh_abs`, `sh_band_limit`, `sh_ratio`). Every filter is a TPT state-variable filter; the corners are far below Fs/7.5 at every rate, so the SVF form is both cheaper (three multiplies per stage once the lowpass update is folded to `v2 = ic2 + g v1`, with LP and HP for free) and more precise than a direct-form biquad.
 
 - **RP2350:** `sh_num_t` is float; the helpers are plain float arithmetic.
-- **RP2040:** `sh_num_t` is Q28 `int32_t`; `sh_mul` is `fast_mul_q28`. The SVF's low-frequency precision matters here: an additive rounding error in a TDF2 biquad at 48 Hz is amplified by roughly 1/omega^2 (about 25 000x) into a DC offset, whereas in the TPT SVF it is amplified by roughly 1/g (about 300x), so the SVF holds a 30 dB better DC floor with the truncating multiplier. `sh_band_limit` clamps each band signal to +/-1.0 before its divider and the boost ceiling is +6 dB, so no legal setting can wrap `fast_mul_q28` past +/-8.0 on inputs up to 0 dBFS. The offline Q28 model matches the float model bit-for-bit in behaviour (sub level, harmonic residue, flip timing).
+- **RP2040:** `sh_num_t` is Q28 `int32_t`; `sh_mul` is `fast_mul_q28`. The SVF's low-frequency precision matters here: an additive rounding error in a TDF2 biquad at 48 Hz is amplified by roughly 1/omega^2 (about 25 000x) into a DC offset, whereas in the TPT SVF it is amplified by roughly 1/g (about 300x), so the SVF holds a 30 dB better DC floor with the truncating multiplier. `sh_input_limit` clamps the sub path's input to +/-3.0, `sh_band_limit` each band signal to +/-1.0 before its divider and `sh_sub_limit` the sub sum to +/-2.0, with the boost ceiling at +6 dB, so no stored value can wrap `fast_mul_q28` past +/-8.0 on inputs up to +9.5 dBFS (the dry path is not clamped). `sh_ratio` (the ceiling gain) normalizes the divisor to 16 bits and uses one 32-bit hardware divide, so the RAM kernel never calls a libgcc 64-bit divide or clz in flash. The host-compiled Q28 kernel matches the float kernel to about -102 dBFS with every stage on.
 
-The block kernel is one out-of-line `DSP_TIME_CRITICAL` function in `subharm.c`, shared by both cores, rather than a header inline like psybass: inlining it at the three call sites cost about 4.7 KB of RAM code on RP2350, and one call per output block is free. State locals are loaded into registers before the sample loop and stored after it; the SVF and band helpers are `always_inline` and take pointers to those locals, so nothing escapes to memory inside the loop. A skipped band (level at the -30 dB floor) or a skipped bell (0 dB) is memset once per block so re-enabling it is transient-free.
+The block kernel `subharm_process_block` is an out-of-line `DSP_TIME_CRITICAL` function in `subharm.c`, shared by both cores, rather than a header inline like psybass: inlining it at the call sites cost several KB of RAM code. Its full-rate loop keeps the anti-alias SVF, interpolator and bell state in registers; the low-rate work (`subharm_low_rate_tick`, `sh_band_tick`, `sh_select_gain`) is out-of-line RAM code working through the state struct, where the memory traffic is cheap and inlining three band ticks into the loop cost 4 KB. The RAM code totals about 3 KB. A skipped band (level at the -30 dB floor), gate (mode ALL), ceiling (0 dB) or bell (0 dB, or any setting while soloed) has its state cleared once per block so re-enabling it is transient-free.
 
 ### Parameters
 
@@ -1214,28 +1231,40 @@ One global config (`SubharmConfig`) applied to the output channels selected by `
 | high_db | float | -30..+6 dB | 0 | 36-56 Hz sub level; -30 = band off (skipped) |
 | boost_db | float | 0..+6 dB | 0 | LF boost bell (70 Hz, Q 0.9) after the sum; 0 = stage skipped |
 | output_mask | uint16 | 0x0000-0xFFFF | 0xFFFF | Bit k: process output channel k |
+| top_db | float | -30..+6 dB | -30 (off) | 56-80 Hz sub level from 112-160 Hz program; -30 = band off |
+| select_mode | uint8 | 0..2 | 0 (all) | Favour all / percussive / sustained bass material |
+| select_depth | float | 0..100 % | 100 | How far the unfavoured material is gated; ignored at mode 0 |
+| select_hold_ms | float | 50..400 ms | 150 | Span the selectivity decision is made over; ignored at mode 0 |
+| ceiling_db | float | -40..0 dBFS | 0 (off) | Soft limit on the synthesized sub before it is mixed in |
+| link_pairs | bool | 0/1 | true | Synthesize each output pair's sub from the pair's mono sum |
+| solo | bool | 0/1 | false | Monitoring: masked outputs carry the sub only. **Runtime state**, never in a preset slot or on the wire, so no saved configuration can boot with the program signal removed. A preset load leaves it alone; only a factory reset clears it. |
+
+The kernel behaviour behind the third band, the selectivity gate, the ceiling and the pair link is in the Signal Flow section above; the rows are the host-facing contract.
 
 ### Headroom Reading
 
-`REQ_GET_SUBHARM_HEADROOM` (0x1A) returns the worst-case gain of the current configuration in dB: the preamp headroom a host must free so the effect cannot clip. `subharm_headroom_db()` is a pure function of the config (not the rate or the mask) evaluated on each GET, so a host can SET and immediately GET without racing the main-loop recompute. It scans an eighth-octave grid from 16 to 256 Hz and sums, as amplitudes, the direct tone through the bell plus each band's divided components (n = 1, 3, 5, 7 at n f/2) through that band's post lowpass and the bell, using analog-prototype magnitudes. The bound is conservative by 1 to 2 dB on real tones and never below the measured peak (offline model: one band at 0 dB 4.2 vs 3.3 dB measured; both bands 6.3 vs 4.4; everything at +6 dB 13.5 vs 11.2). Because the divider preserves band amplitude and every other stage is linear, a preamp cut of the reported amount is an exact correction. This is the first contributor to the planned per-output headroom budget; the budget will sum the worst-case boost of every stage in an output's chain.
+`REQ_GET_SUBHARM_HEADROOM` (0x1A) returns the worst-case gain of the current configuration in dB: the preamp headroom a host must free so the effect cannot clip. `subharm_headroom_db()` is a pure function of the config (not the rate or the mask) evaluated on each GET, so a host can SET and immediately GET without racing the main-loop recompute. It scans an eighth-octave grid from 16 to 362 Hz and sums, as amplitudes, the direct tone through the bell plus each of the three bands' divided components (n = 1, 3, 5, 7 at n f/2) through that band's post lowpass and the bell, using analog-prototype magnitudes; with a ceiling on it bisects on the input level for the smallest headroom at which an input that far below full scale cannot exceed it, because the ceiling is absolute and stops limiting once the preamp is lowered. Selectivity and the pair link only ever lower the sub, so they never raise the bound. The bound is conservative by 1 to 2 dB on real tones and never below the measured peak (offline model: one band at 0 dB 4.2 vs 3.3 dB measured; both bands 6.3 vs 4.4; everything at +6 dB 13.5 vs 11.2). Because the divider preserves band amplitude and every other stage is linear, a preamp cut of the reported amount is an exact correction. This is the first contributor to the planned per-output headroom budget; the budget will sum the worst-case boost of every stage in an output's chain.
 
 ### Coefficient Publish & Per-Output State
 
 Follows the psybass module pattern:
 
 - **Double-buffered publish.** `subharm.c` computes one shared `SubharmCoeffs` into the inactive buffer and atomically publishes the pointer via `volatile const SubharmCoeffs *current_subharm_coeffs` (**NULL = disabled**). Vendor SET handlers write `subharm_config` and raise `subharm_update_pending`; the main loop consumes the flag and calls `subharm_apply_config()`. Coefficients are also recomputed on rate change (`perform_rate_change()` raises the flag). Initial setup runs once in `core0_init()`.
-- **Per-output state ownership.** `SubharmOutputState subharm_output_state[NUM_OUTPUT_CHANNELS]` (68 bytes each) lives in `subharm.c`; each output is only ever touched by the core that owns it in the current pipeline mode.
-- **Skip-and-reset predicate.** Identical to psybass: coeffs published AND mask bit set AND matrix-enabled AND not muted AND not carrying a siggen RAW signal; otherwise `subharm_reset_output_state()` each packet. Wired at all six pipeline call sites (single-core and dual-core loops on both platform branches of `audio_pipeline.c`, and both Core 1 EQ-worker loops in `pdm_generator.c`), and the disabled PDM output's state is kept cleared in EQ_WORKER mode. Subharm runs **pre-crossover and ahead of psybass**, so it divides the program bass rather than synthesized harmonics.
-- **Two-core coherence.** Core 0 snapshots the coefficient pointer + `output_mask` once per packet into the `Core1EqWork` fields `subharm_coeffs`/`subharm_mask`.
-- **RAM cost.** About 600 B on RP2040 and 900 B of `.bss` on RP2350 (state array plus two coefficient buffers), plus one RAM-resident kernel copy of roughly 1 KB.
-- **CPU cost.** Six SVFs, two dividers and one allpass per masked output per sample, about 1.7x psybass. Skipped outputs, bands and bell cost nothing beyond a state clear.
+- **Per-output state ownership.** `SubharmOutputState subharm_output_state[NUM_OUTPUT_CHANNELS]` (160 bytes each) lives in `subharm.c`; each output is only ever touched by the core that owns it in the current pipeline mode. `subharm_reset_output_state()` zeroes everything except the ceiling gain, which idles at unity so a fresh output is not faded in over the limiter's release; an `active` flag marks a state as fresh until its first block, when the partner seeding above applies.
+- **Per-packet pass.** `subharm_process_outputs(coeffs, mask, flags, first, last, buf_out, n)` replaced the per-output snippets at all six pipeline call sites (single-core and dual-core loops on both platform branches of `audio_pipeline.c`, and both Core 1 EQ-worker loops in `pdm_generator.c`). It runs once per packet over that core's output range, right after crossfeed and before the per-output loop, so it still precedes psybass. Eligibility per output is the psybass predicate: coeffs published AND mask bit set AND matrix-enabled AND not muted AND not carrying a siggen RAW signal. With the link flag, an even output and its partner that are both eligible and both inside the range run as a linked pair (never across the core boundary: pair 0 is core 0's, pairs 1+ are core 1's, and the PDM output is never paired); the partner's state keeps only its bell and meter. Everything else runs singly or is reset. The disabled PDM output's state is kept cleared in EQ_WORKER mode.
+- **Two-core coherence.** Core 0 snapshots the coefficient pointer, `output_mask`, the link/solo flags (`subharm_flags_snapshot()`) and the packet's decimation phase (`subharm_packet_phase()`) once per packet into the `Core1EqWork` fields `subharm_coeffs`/`subharm_mask`/`subharm_flags`/`subharm_phase`. Link and solo, like the mask, are read live and need no coefficient recompute.
+- **RAM cost.** About 1.2 KB on RP2040 and 1.9 KB of `.bss` on RP2350 (state array plus two coefficient buffers), plus about 3 KB of RAM-resident code.
+- **CPU cost.** Per processed output about 12 multiplies per sample with the default two bands and about 16 with three bands, selectivity and ceiling on, against 25 for the original full-rate kernel: one SVF, the interpolator and the bell at full rate, everything else at one sixth of the rate. A linked pair costs one kernel plus one bell. Skipped outputs, bands, gate, ceiling and bell cost nothing beyond a state clear.
 
 ### Persistence & Control
 
 - **Wire format V29:** `WireSubharmParams` (16 bytes) is tail-appended to `WireBulkParams` at offset 5944 (`enabled` + `reserved0` + `output_mask` + three floats; total 5960 bytes). Bulk collect/apply copy it straight to/from `subharm_config` and raise the pending flag.
+- **Wire format V30:** the section grows to 36 bytes by tail-appending `top_db`, `select_depth`, `select_hold_ms`, `ceiling_db`, `select_mode`, `link_pairs` and two reserved bytes, taking the packet total to **5980 bytes**. The section offset stays 5944. Apply clamps `select_mode`; the floats are clamped downstream. `solo` is not on the wire, so a bulk apply never changes it.
 - **Preset slot V36:** the config is tail-appended to `PresetSlot` (struct grows 16 bytes; `SLOT_DATA_SIZE_V36`), gated on `slot->version >= 36` in `apply_slot_to_live()`. Older slots load the disabled/all-outputs defaults; V21..V35 slots still validate via `slot_data_size_for_version()`. Factory defaults set it disabled with `SUBHARM_DEFAULT_*` values.
-- **Vendor commands:** `0x10-0x1A` (SET/GET enable, low, high, boost, mask; GET headroom), the first application commands allocated inside 0x00-0x1F. Each SET clamps to the parameter range, writes `subharm_config`, and emits a `notify_param_write`. All SETs except the mask raise `subharm_update_pending`. See the Vendor Command Reference table.
-- **Control Surfaces:** caps v14 nouns 57-60 (`SUBHARM`, `SUBHARM_LOW`, `SUBHARM_HIGH`, `SUBHARM_BOOST`).
+- **Preset slot V37:** the V30 fields are tail-appended in turn (struct grows a further 20 bytes; `SLOT_DATA_SIZE_V37`), gated on `slot->version >= 37`. V36 slots load the `SUBHARM_DEFAULT_*` values for them. `solo` is not stored.
+- **Vendor commands:** `0x10-0x1F`, `0x2C-0x2F` and `0xA9-0xAE` (SET/GET enable, low, high, boost, mask, top, selectivity mode/depth/hold, ceiling, link, solo; GET headroom and sub meter). 0x10-0x1F were the first application commands allocated inside 0x00-0x1F. Each SET clamps to the parameter range, writes `subharm_config`, and emits a `notify_param_write`. The mask, link and solo SETs do **not** raise `subharm_update_pending` (the pipeline reads them live each packet); every other SET does. Solo has no wire offset, so it emits no notification. See the Vendor Command Reference table.
+- **Sub meter:** `REQ_GET_SUBHARM_METER` (0x1F) returns `NUM_OUTPUT_CHANNELS` uint16 LE values from `subharm_meter_u16()`, a decaying peak of the synthesized sub per output on the same 0..32767 scale as `SystemStatusPacket.peaks`. 18 bytes on RP2350, 10 on RP2040.
+- **Control Surfaces:** caps v14 nouns 57-60 (`SUBHARM`, `SUBHARM_LOW`, `SUBHARM_HIGH`, `SUBHARM_BOOST`) and caps v15 nouns 61-67 (`SUBHARM_TOP`, `SUBHARM_SELECT`, `SUBHARM_DEPTH`, `SUBHARM_HOLD`, `SUBHARM_CEILING`, `SUBHARM_LINK`, `SUBHARM_SOLO`).
 
 ---
 
@@ -1633,7 +1662,7 @@ platform-dependent and validate at apply / render time). See
 | cs_display | Control Surfaces display config and pages (V19+, 80-byte `CsDisplayFlash`: version + 12-byte `CsDisplayCfg` + 16x 4-byte `CsDisplayPage`; all-zero = display idle, no pages; board-level, survives factory reset) |
 
 ### Preset Slot Data (Version 12)
-*Last updated: 2026-07-19 (upmixer presence byte, slot V34; `SLOT_DATA_VERSION` now 34)*
+*Last updated: 2026-09-04 (subharm third band / selectivity / ceiling / link, slot V37; `SLOT_DATA_VERSION` now 37)*
 
 | Field | Description |
 |-------|-------------|
@@ -1650,7 +1679,7 @@ platform-dependent and validate at apply / render time). See
 | Loudness | enabled, reference SPL, intensity |
 | Crossfeed | enabled, preset, ITD, custom fc/feed, output_pair_mask (V27+, tail-appended; older slots default 0x01) |
 | Psychoacoustic bass | enabled, output_mask, cutoff, harmonics, drive, character, original (V31+, tail-appended 24 bytes, `SLOT_DATA_VERSION` 31; older slots load disabled/all-outputs defaults) |
-| Subharmonic synthesizer | enabled, output_mask, low_db, high_db, boost_db (V36+, tail-appended 16 bytes, `SLOT_DATA_VERSION` 36; older slots load disabled/all-outputs defaults) |
+| Subharmonic synthesizer | enabled, output_mask, low_db, high_db, boost_db (V36+, tail-appended 16 bytes); top_db, select_depth, select_hold_ms, ceiling_db, select_mode, link_pairs (V37+, tail-appended 20 more bytes, `SLOT_DATA_VERSION` 37). Pre-V36 slots load disabled/all-outputs defaults; V36 slots load the `SUBHARM_DEFAULT_*` values for the V37 fields. `solo` is runtime-only and never stored |
 | Stereo upmixer | enabled, centre/surround modes, presence_q1 (V34+, int8 dB * 2, was reserved), ten floats (V33+, tail-appended 44 bytes; `SLOT_DATA_VERSION` now 34, size unchanged from V33; RP2350 only, gated on version >= 33; older slots load disabled defaults; RP2040 stores zeros and never applies them) |
 | Matrix mixer | crosspoints + output channels |
 | Pin config | NUM_PIN_OUTPUTS pin assignments (always stored, conditionally loaded) |
@@ -1884,7 +1913,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 ---
 
 ## RP2040 vs RP2350 Comparison
-*Last updated: 2026-08-06 (input capture arena row; EQ cascade row: SVF pairs now fuse too)*
+*Last updated: 2026-09-04 (subharm row: new parameters and per-output sub meter; wire/slot row V30/V37)*
 
 ### Hardware
 
@@ -1930,7 +1959,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | Input capture arena (shared SPDIF FIFO / I2S rings / ADAT ring) | 12,288 B, 4096-aligned (SPDIF FIFO is the largest member) | 32,768 B, 8192-aligned (the four I2S rings are the largest member) |
 | USB input bit depth | 16-bit or 24-bit (alt) | 16/24-bit (stereo) or 16-bit (multichannel) |
 | AS alt settings | 0, 1 (16-bit), 2 (24-bit) | 0, 1, 2, 3 (4ch), 4 (6ch), 5 (8ch) |
-| Wire / slot version | V29 / V36 | V29 / V36 |
+| Wire / slot version | V30 / V37 | V30 / V37 |
 | S/PDIF bit depth | 24-bit | 24-bit |
 | S/PDIF input conversion | 24-bit sign-extended full-scale → Q28 via `>> 2` (equivalent to `sample << 6`) | 24-bit sign-extended full-scale → float via `÷ 2147483648.0f` |
 | S/PDIF output conversion | Q28 >> 6 → int24 | float × 8388607 → int24 |
@@ -1938,7 +1967,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | Loudness | Per output, post-gain: 2 Q28 shelf biquads; `loudness_output_mask` (5 outputs) | Per output, post-gain: 2 SVF shelves; `loudness_output_mask` (9 outputs). Both platforms: volume-keyed, works in stereo and multichannel input modes |
 | Crossfeed | Per output pair, post-matrix (PASS 4.5); 2 pairs; `output_pair_mask` (default pair 1) | Per output pair, post-matrix (PASS 4.5); 4 pairs; `output_pair_mask` (default pair 1). Both platforms: shared coeffs, per-pair state, works in every input mode |
 | Psychoacoustic bass | Per output, pre-crossover; RBJ Q28 biquads (with pre-drive low-band clamp) | Per output, pre-crossover; TPT SVF float. Both platforms: missing-fundamental NLD, `output_mask`, zero added latency |
-| Subharmonic synthesizer | Per output, pre-crossover, ahead of psybass; same kernel in Q28 through `fast_mul_q28` (band clamp before the divider) | Per output, pre-crossover, ahead of psybass; same kernel in float. Both platforms: TPT SVF band split, two hysteresis octave dividers, phase-aligned sum, LF bell, `output_mask`, headroom reading, zero added latency |
+| Subharmonic synthesizer | Per output, pre-crossover, ahead of psybass; same kernel in Q28 through `fast_mul_q28` (band clamp before the divider); 10-byte sub meter (5 outputs) | Per output, pre-crossover, ahead of psybass; same kernel in float; 18-byte sub meter (9 outputs). Both platforms: TPT SVF band split, hysteresis octave dividers, phase-aligned sum, LF bell, `output_mask`, selectivity, sub ceiling, pair link, runtime solo, headroom reading, zero added latency |
 | Stereo upmixer | Not available (compiled out; matrix untouched) | Stereo input only: derives C/Ls/Rs into matrix rows 2..4 (passive/adaptive/off centre; off/passive/adaptive surround). Zero-latency steering; deliberate per-row surround Haas delay |
 | EQ channels | 7 (NUM_CHANNELS) | 11 (NUM_CHANNELS) |
 
@@ -2500,7 +2529,7 @@ format version is unchanged by this feature.
 ---
 
 ## Control Surfaces (User-Wired Physical Controls)
-*Last updated: 2026-09-02 (caps v14: subharmonic synthesizer nouns 57-60; 2026-08-24: input-source stepping skips unselectable sources; caps v13: display level bars; caps v12: per-LED PWM brightness ceiling; caps v11: display line alignment and edit markers; caps v10: I2C display component, IR group support, nouns 53-56, commands 0x27-0x2B, directory V19)*
+*Last updated: 2026-09-04 (caps v15: subharmonic synthesizer nouns 61-67; 2026-09-02 caps v14: subharmonic synthesizer nouns 57-60; 2026-08-24: input-source stepping skips unselectable sources; caps v13: display level bars; caps v12: per-LED PWM brightness ceiling; caps v11: display line alignment and edit markers; caps v10: I2C display component, IR group support, nouns 53-56, commands 0x27-0x2B, directory V19)*
 
 User-wired push buttons, toggle switches, potentiometers, quadrature rotary
 encoders, plain indicator LEDs, PWM-dimmed LEDs, an IR remote receiver, and an
@@ -2655,6 +2684,18 @@ synthesizer with no structure or stored-config changes: `SUBHARM` (enable,
 via the per-param `0x12`/`0x14` SETs) and `SUBHARM_BOOST` (0..+6 dB via
 `0x16`), taking `noun_count` to 61. Display labels are "Subharm", "Sub 24-36",
 "Sub 36-56" and "LF Boost".
+
+**Caps v15** (2026-09-04) appends the rest of the subharmonic synthesizer's
+parameters as nouns 61-67, again with no structure or stored-config changes:
+`SUBHARM_TOP` (-30..+6 dB via `0x1B`), `SUBHARM_SELECT` (enum 0-2 via `0x1D`,
+labels "All" / "Percussive" / "Sustained"), `SUBHARM_DEPTH` (0..100 % via
+`0xA9`), `SUBHARM_HOLD` (ms via `0xAB`), `SUBHARM_CEILING` (-40..0 dB via
+`0xAD`), `SUBHARM_LINK` (bool via `0x2E`) and `SUBHARM_SOLO` (bool via `0x2C`),
+taking `noun_count` to 68. The hold noun's caps range stops at 127 ms because
+`CsNounDesc.min_q`/`max_q` are signed 8.8 fixed point; the command still accepts
+the documented 50..400 ms, the same limitation `CS_LOUDNESS_INTENSITY_MAX`
+already carries. Display labels are "Sub 56-80", "Sub Select", "Sub Depth",
+"Sub Hold", "Sub Ceil", "Sub Link" and "Sub Solo".
 
 ### File layout
 
@@ -3147,7 +3188,7 @@ RP2040 like the rest of the engine.
 ---
 
 ## Vendor Command Reference
-*Last updated: 2026-09-02 (subharmonic synthesizer 0x10-0x1A; REQ_GET_BUILD_INFO 0x80 added 2026-09-01: 64-byte git/date build stamp)*
+*Last updated: 2026-09-04 (subharmonic synthesizer widened to 0x10-0x1F, 0x2C-0x2F and 0xA9-0xAE; 2026-09-02: subharmonic synthesizer 0x10-0x1A; REQ_GET_BUILD_INFO 0x80 added 2026-09-01: 64-byte git/date build stamp)*
 
 **Band-index map (PEQ and crossover share one address space):**
 
@@ -3174,6 +3215,21 @@ RP2040 like the rest of the engine.
 | REQ_SET_SUBHARM_MASK | 0x18 | OUT | Set output mask (2-byte LE uint16; read live, no recompute) |
 | REQ_GET_SUBHARM_MASK | 0x19 | IN | Get output mask (2-byte LE uint16) |
 | REQ_GET_SUBHARM_HEADROOM | 0x1A | IN | Get the preamp headroom the current subharm config needs (4-byte float dB, 0 while disabled; computed on request) |
+| REQ_SET_SUBHARM_TOP | 0x1B | OUT | Set 56-80 Hz sub level (4-byte float, -30..+6 dB, clamped; -30 = band off) |
+| REQ_GET_SUBHARM_TOP | 0x1C | IN | Get 56-80 Hz sub level (4-byte float) |
+| REQ_SET_SUBHARM_SELECT | 0x1D | OUT | Set selectivity mode (1 byte: 0 all, 1 percussive, 2 sustained; above 2 clamps to 2) |
+| REQ_GET_SUBHARM_SELECT | 0x1E | IN | Get selectivity mode (1 byte) |
+| REQ_GET_SUBHARM_METER | 0x1F | IN | Get the per-output synthesized-sub peak (NUM_OUTPUT_CHANNELS x uint16 LE, 0..32767 each; 18 B RP2350 / 10 B RP2040) |
+| REQ_SET_SUBHARM_SOLO | 0x2C | OUT | Solo the synthesized sub on masked outputs (1 byte, 0/1). Runtime only: never persisted, never on the wire, no notification |
+| REQ_GET_SUBHARM_SOLO | 0x2D | IN | Get subharm solo state (1 byte) |
+| REQ_SET_SUBHARM_LINK | 0x2E | OUT | Synthesize each output pair's sub from the pair's mono sum (1 byte, 0/1; read live, no recompute) |
+| REQ_GET_SUBHARM_LINK | 0x2F | IN | Get subharm pair-link state (1 byte) |
+| REQ_SET_SUBHARM_DEPTH | 0xA9 | OUT | Set selectivity depth (4-byte float, 0..100 %, clamped) |
+| REQ_GET_SUBHARM_DEPTH | 0xAA | IN | Get selectivity depth (4-byte float) |
+| REQ_SET_SUBHARM_HOLD | 0xAB | OUT | Set selectivity hold time (4-byte float, 50..400 ms, clamped) |
+| REQ_GET_SUBHARM_HOLD | 0xAC | IN | Get selectivity hold time (4-byte float) |
+| REQ_SET_SUBHARM_CEILING | 0xAD | OUT | Set the sub ceiling (4-byte float, -40..0 dBFS, clamped; 0 = off) |
+| REQ_GET_SUBHARM_CEILING | 0xAE | IN | Get the sub ceiling (4-byte float) |
 | REQ_SET_CS_GROUP | 0x20 | OUT | Set a Control Surfaces target group (wValue=group 0-7, payload=40-byte CsGroup; all-zero clears); apply-live-only preview, deferred, poll 0x87 (last_slot = 0x40\|group) |
 | REQ_GET_CS_GROUP | 0x21 | IN | Get the live 40-byte CsGroup (wValue=group 0-7) |
 | REQ_SET_CS_MACRO | 0x22 | OUT | Set a macro's name and step count (wValue=macro 0-7, payload=36-byte CsMacroHeaderWire); apply-live-only, deferred, poll 0x87 (last_slot = 0x60\|macro) |
@@ -3369,11 +3425,11 @@ RP2040 like the rest of the engine.
 | REQ_GET_I2S_CLOCK_PIN_MODE | 0xFF | IN | Get live I2S clock-pin mode (returns uint8_t: 0 = unified, 1 = split) |
 
 ### Bulk Parameter Transfer
-*Last updated: 2026-08-02 (wire V28: input-config `spdif_rx_pin_ext` grows to 3 entries for SPDIF input 4; section and total size unchanged)*
+*Last updated: 2026-09-04 (wire V30: subharm section grows 16 to 36 bytes, total 5980; 2026-08-02 wire V28: input-config `spdif_rx_pin_ext` grows to 3 entries for SPDIF input 4; section and total size unchanged)*
 
 Transfers the complete DSP state in a single USB control transfer (3664 bytes at V11/V12), replacing dozens of individual vendor requests.
 
-**Wire format:** `WireBulkParams` (`bulk_params.h`, `WIRE_FORMAT_VERSION` 29, total 5960 bytes); packed struct with header, global params, crossfeed, legacy channel gains, delays, matrix crosspoints, matrix outputs, pin config, EQ bands, channel names, I2S config, leveller config, preamp config (`WirePreampConfig`, 16 bytes), master volume config (`WireMasterVolume`, 16 bytes), input source config (`WireInputConfig`, 16 bytes), LG Sound Sync (`WireLgSoundSync`, 16 bytes), user volume/mute (`WireUserVolume`, 16 bytes), DAC hardware mute (`WireDacHwMute`, 16 bytes, V10+), and **crossover bands** (`WireCrossoverConfig`, 704 bytes = 11 × 4 × `WireBandParams`, V11+). V12 claims two reserved bytes inside `WireInputConfig` for `i2s_rx_pin` and `i2s_input_rate` (enum 0=44100, 1=48000, 2=96000); V12 payloads are byte-identical in size to V11. All arrays sized at platform maximums (RP2350: 11 channels, 9 outputs, 5 pins, 12 PEQ bands, 4 crossover bands per channel). Unused entries zero-padded; for crossover, master rows (channel < `CH_OUT_1`) are zeroed on collect and skipped on apply. **V20** repurposes the `WireCrossfeedParams` reserved byte (offset 3) as `output_pair_mask` (bit p = crossfeed on output pair p); struct sizes are unchanged. **V22** carries the Linkwitz-Transform target `Q` in the EQ `WireBandParams.reserved[2]` bytes (`uint16` LE, `Q*512`; zero for non-LT types), so struct sizes stay unchanged. (V21 claimed one `WireInputConfig` reserved byte for the I2S clock master/slave mode, also size-neutral.) **V23** tail-appends the 24-byte `WirePsybassParams` (psychoacoustic bass: `enabled` + `output_mask` + five floats), bringing the total to 5900 bytes. **V24** claims three `WireInputConfig` reserved bytes for the ADAT input (`adat_input_pin`, `adat_input_enabled_p1`, `adat_clock_mode_p1`, each 0 = absent/keep-live); struct sizes and the 5900-byte total are unchanged. **V25** tail-appends the 44-byte `WireUpmixParams` (RP2350 stereo upmixer: enabled + centre/surround modes + reserved + ten floats; layout-identical to `UpmixConfigPacket`), bringing the total to 5944 bytes; the section is zeroed on collect and ignored on apply on RP2040. **V28** widens `WireInputConfig.spdif_rx_pin_ext` from 2 to 3 entries (SPDIF input 4), consuming that section's last reserved byte and shifting `spdif_rx_enabled_ext_p1`, `i2s_clock_mode` and the ADAT input fields down one byte; the section stays 16 bytes and the 5944-byte total and every later section offset are unchanged. The input-config section now has no reserved bytes left. **V29** tail-appends the 16-byte `WireSubharmParams` (subharmonic synthesizer: `enabled` + `reserved0` + `output_mask` + `low_db`/`high_db`/`boost_db`) at offset 5944, bringing the total to 5960 bytes.
+**Wire format:** `WireBulkParams` (`bulk_params.h`, `WIRE_FORMAT_VERSION` 30, total 5980 bytes); packed struct with header, global params, crossfeed, legacy channel gains, delays, matrix crosspoints, matrix outputs, pin config, EQ bands, channel names, I2S config, leveller config, preamp config (`WirePreampConfig`, 16 bytes), master volume config (`WireMasterVolume`, 16 bytes), input source config (`WireInputConfig`, 16 bytes), LG Sound Sync (`WireLgSoundSync`, 16 bytes), user volume/mute (`WireUserVolume`, 16 bytes), DAC hardware mute (`WireDacHwMute`, 16 bytes, V10+), and **crossover bands** (`WireCrossoverConfig`, 704 bytes = 11 × 4 × `WireBandParams`, V11+). V12 claims two reserved bytes inside `WireInputConfig` for `i2s_rx_pin` and `i2s_input_rate` (enum 0=44100, 1=48000, 2=96000); V12 payloads are byte-identical in size to V11. All arrays sized at platform maximums (RP2350: 11 channels, 9 outputs, 5 pins, 12 PEQ bands, 4 crossover bands per channel). Unused entries zero-padded; for crossover, master rows (channel < `CH_OUT_1`) are zeroed on collect and skipped on apply. **V20** repurposes the `WireCrossfeedParams` reserved byte (offset 3) as `output_pair_mask` (bit p = crossfeed on output pair p); struct sizes are unchanged. **V22** carries the Linkwitz-Transform target `Q` in the EQ `WireBandParams.reserved[2]` bytes (`uint16` LE, `Q*512`; zero for non-LT types), so struct sizes stay unchanged. (V21 claimed one `WireInputConfig` reserved byte for the I2S clock master/slave mode, also size-neutral.) **V23** tail-appends the 24-byte `WirePsybassParams` (psychoacoustic bass: `enabled` + `output_mask` + five floats), bringing the total to 5900 bytes. **V24** claims three `WireInputConfig` reserved bytes for the ADAT input (`adat_input_pin`, `adat_input_enabled_p1`, `adat_clock_mode_p1`, each 0 = absent/keep-live); struct sizes and the 5900-byte total are unchanged. **V25** tail-appends the 44-byte `WireUpmixParams` (RP2350 stereo upmixer: enabled + centre/surround modes + reserved + ten floats; layout-identical to `UpmixConfigPacket`), bringing the total to 5944 bytes; the section is zeroed on collect and ignored on apply on RP2040. **V28** widens `WireInputConfig.spdif_rx_pin_ext` from 2 to 3 entries (SPDIF input 4), consuming that section's last reserved byte and shifting `spdif_rx_enabled_ext_p1`, `i2s_clock_mode` and the ADAT input fields down one byte; the section stays 16 bytes and the 5944-byte total and every later section offset are unchanged. The input-config section now has no reserved bytes left. **V29** tail-appends the 16-byte `WireSubharmParams` (subharmonic synthesizer: `enabled` + `reserved0` + `output_mask` + `low_db`/`high_db`/`boost_db`) at offset 5944, bringing the total to 5960 bytes. **V30** grows that section to 36 bytes by tail-appending `top_db`, `select_depth`, `select_hold_ms`, `ceiling_db`, `select_mode`, `link_pairs` and two reserved bytes, bringing the total to 5980 bytes; the section offset stays 5944 and `solo` is deliberately absent (runtime-only).
 
 **Per-version size anchors** live in `bulk_params.h` (`WIRE_BULK_PARAMS_V{N}_SIZE`, N=2..12). Each legacy-section apply gate inside `bulk_params_apply()` compares `payload_length` against its own version's anchor, NOT against `sizeof(WireBulkParams)`. Without this discipline, growing the struct would silently lock older payloads out of the very tail sections they own (e.g. a V10 payload would stop applying its DAC-mute section the moment V11 was added). V<11 payloads leave crossover state untouched on apply; V<12 payloads leave the I2S input pin/rate untouched.
 

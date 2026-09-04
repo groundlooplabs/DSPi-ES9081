@@ -4,7 +4,7 @@ Loudness / crossfeed / matrix-mixer group.
 Loudness   0x58-0x5D
 Crossfeed  0x5E-0x67
 Matrix     0x70/0x71
-Subharm    0x10-0x1A
+Subharm    0x10-0x1F, 0x2C-0x2F, 0xA9-0xAE
 """
 
 import struct
@@ -200,3 +200,114 @@ def subharm_headroom(dev, profile, chk):
     boosted = dev.get_f32(OP.GET_SUBHARM_HEADROOM)
     chk.ok(boosted >= two_band + 3.0, f"+6 dB boost raises it ({two_band:.2f} -> {boosted:.2f} dB)")
     dev.set_u8(OP.SET_SUBHARM, 0)
+
+
+@test("dynamics", mutating=True)
+def subharm_top_clamp(dev, profile, chk):
+    """0x1B/0x1C third band level clamps to [-30,+6]."""
+    prev = dev.get_f32(OP.GET_SUBHARM_TOP)
+    float_roundtrip(dev, chk, OP.SET_SUBHARM_TOP, OP.GET_SUBHARM_TOP, -12.0, label="top -12")
+    float_clamp(dev, chk, OP.SET_SUBHARM_TOP, OP.GET_SUBHARM_TOP, -99.0, -30.0, label="top low clamp")
+    float_clamp(dev, chk, OP.SET_SUBHARM_TOP, OP.GET_SUBHARM_TOP, 40.0, 6.0, label="top high clamp")
+    dev.set_f32(OP.SET_SUBHARM_TOP, prev)
+
+
+@test("dynamics", mutating=True)
+def subharm_select_clamps(dev, profile, chk):
+    """0x1D/0x1E selectivity mode round-trips 0-2; above 2 clamps (not dropped)."""
+    prev = dev.get_u8(OP.GET_SUBHARM_SELECT)
+    for m in (0, 1, 2):
+        dev.set_u8(OP.SET_SUBHARM_SELECT, m)
+        chk.eq(dev.get_u8(OP.GET_SUBHARM_SELECT), m, f"mode {m} roundtrip")
+    dev.set_u8(OP.SET_SUBHARM_SELECT, 7)
+    chk.eq(dev.get_u8(OP.GET_SUBHARM_SELECT), 2, "mode 7 clamps to 2")
+    dev.set_u8(OP.SET_SUBHARM_SELECT, prev)
+
+
+@test("dynamics", mutating=True)
+def subharm_select_depth_hold_clamps(dev, profile, chk):
+    """0xA9-0xAC selectivity depth clamps to [0,100] %, hold to [50,400] ms."""
+    prev_depth = dev.get_f32(OP.GET_SUBHARM_DEPTH)
+    prev_hold = dev.get_f32(OP.GET_SUBHARM_HOLD)
+    float_roundtrip(dev, chk, OP.SET_SUBHARM_DEPTH, OP.GET_SUBHARM_DEPTH, 50.0, label="depth 50")
+    float_clamp(dev, chk, OP.SET_SUBHARM_DEPTH, OP.GET_SUBHARM_DEPTH, -10.0, 0.0, label="depth low clamp")
+    float_clamp(dev, chk, OP.SET_SUBHARM_DEPTH, OP.GET_SUBHARM_DEPTH, 999.0, 100.0, label="depth high clamp")
+    float_roundtrip(dev, chk, OP.SET_SUBHARM_HOLD, OP.GET_SUBHARM_HOLD, 200.0, label="hold 200")
+    float_clamp(dev, chk, OP.SET_SUBHARM_HOLD, OP.GET_SUBHARM_HOLD, 1.0, 50.0, label="hold low clamp")
+    float_clamp(dev, chk, OP.SET_SUBHARM_HOLD, OP.GET_SUBHARM_HOLD, 5000.0, 400.0, label="hold high clamp")
+    dev.set_f32(OP.SET_SUBHARM_DEPTH, prev_depth)
+    dev.set_f32(OP.SET_SUBHARM_HOLD, prev_hold)
+
+
+@test("dynamics", mutating=True)
+def subharm_ceiling_clamp(dev, profile, chk):
+    """0xAD/0xAE sub ceiling clamps to [-40,0] dBFS (0 = off)."""
+    prev = dev.get_f32(OP.GET_SUBHARM_CEILING)
+    float_roundtrip(dev, chk, OP.SET_SUBHARM_CEILING, OP.GET_SUBHARM_CEILING, -6.0, label="ceiling -6")
+    float_clamp(dev, chk, OP.SET_SUBHARM_CEILING, OP.GET_SUBHARM_CEILING, -99.0, -40.0, label="ceiling low clamp")
+    float_clamp(dev, chk, OP.SET_SUBHARM_CEILING, OP.GET_SUBHARM_CEILING, 12.0, 0.0, label="ceiling high clamp")
+    dev.set_f32(OP.SET_SUBHARM_CEILING, prev)
+
+
+@test("dynamics", mutating=True)
+def subharm_link_solo_bools(dev, profile, chk):
+    """0x2E/0x2F link and 0x2C/0x2D solo use != 0 coercion."""
+    prev_link = dev.get_u8(OP.GET_SUBHARM_LINK)
+    bool_roundtrip(dev, chk, OP.SET_SUBHARM_LINK, OP.GET_SUBHARM_LINK, label="subharm link")
+    bool_roundtrip(dev, chk, OP.SET_SUBHARM_SOLO, OP.GET_SUBHARM_SOLO, label="subharm solo")
+    dev.set_u8(OP.SET_SUBHARM_LINK, prev_link)
+    # Solo is monitor-only and must never be left on for the next test.
+    dev.set_u8(OP.SET_SUBHARM_SOLO, 0)
+    chk.eq(dev.get_u8(OP.GET_SUBHARM_SOLO), 0, "solo restored to off")
+
+
+@test("dynamics")
+def subharm_meter_length(dev, profile, chk):
+    """0x1F returns one uint16 sub peak per output channel."""
+    n = profile.num_output_channels
+    data = dev.get(OP.GET_SUBHARM_METER, 2 * n)
+    chk.eq(len(data), 2 * n, f"{n} outputs -> {2 * n} bytes")
+    peaks = struct.unpack(f"<{n}H", data)
+    chk.ok(all(p <= 32767 for p in peaks), "every peak inside the 0..32767 status scale")
+
+
+@test("dynamics", mutating=True)
+def subharm_bulk_roundtrip(dev, profile, chk):
+    """The V30 subharm wire section carries the new fields through GET/SET_ALL_PARAMS."""
+    before = dev.get_ready(OP.GET_ALL_PARAMS, profile.bulk_payload_len)
+    saved = {op: dev.get_f32(op) for op in (OP.GET_SUBHARM_TOP, OP.GET_SUBHARM_DEPTH,
+                                            OP.GET_SUBHARM_HOLD, OP.GET_SUBHARM_CEILING)}
+    saved_mode = dev.get_u8(OP.GET_SUBHARM_SELECT)
+    saved_link = dev.get_u8(OP.GET_SUBHARM_LINK)
+    dev.set_f32(OP.SET_SUBHARM_TOP, -9.0)
+    dev.set_f32(OP.SET_SUBHARM_DEPTH, 25.0)
+    dev.set_f32(OP.SET_SUBHARM_HOLD, 250.0)
+    dev.set_f32(OP.SET_SUBHARM_CEILING, -12.0)
+    dev.set_u8(OP.SET_SUBHARM_SELECT, 1)
+    dev.set_u8(OP.SET_SUBHARM_LINK, 0)
+    dev.set_u8(OP.SET_SUBHARM_SOLO, 1)
+    blob = dev.get_ready(OP.GET_ALL_PARAMS, profile.bulk_payload_len)
+    # Clear the live values, then prove the blob restores every persisted one.
+    dev.set_f32(OP.SET_SUBHARM_TOP, -30.0)
+    dev.set_f32(OP.SET_SUBHARM_DEPTH, 100.0)
+    dev.set_f32(OP.SET_SUBHARM_HOLD, 50.0)
+    dev.set_f32(OP.SET_SUBHARM_CEILING, 0.0)
+    dev.set_u8(OP.SET_SUBHARM_SELECT, 0)
+    dev.set_u8(OP.SET_SUBHARM_LINK, 1)
+    dev.set(OP.SET_ALL_PARAMS, blob)
+    dev.wait_ready()
+    chk.approx(dev.get_f32(OP.GET_SUBHARM_TOP), -9.0, 1e-3, "top restored")
+    chk.approx(dev.get_f32(OP.GET_SUBHARM_DEPTH), 25.0, 1e-3, "depth restored")
+    chk.approx(dev.get_f32(OP.GET_SUBHARM_HOLD), 250.0, 1e-3, "hold restored")
+    chk.approx(dev.get_f32(OP.GET_SUBHARM_CEILING), -12.0, 1e-3, "ceiling restored")
+    chk.eq(dev.get_u8(OP.GET_SUBHARM_SELECT), 1, "select mode restored")
+    chk.eq(dev.get_u8(OP.GET_SUBHARM_LINK), 0, "link restored")
+    # Solo is deliberately off the wire, so a bulk apply must leave it alone.
+    chk.eq(dev.get_u8(OP.GET_SUBHARM_SOLO), 1, "solo untouched by bulk apply")
+    dev.set_u8(OP.SET_SUBHARM_SOLO, 0)
+    dev.set(OP.SET_ALL_PARAMS, before)
+    dev.wait_ready()
+    for op, val in saved.items():
+        chk.approx(dev.get_f32(op), val, 1e-3, f"pre-test 0x{op:02X} value restored")
+    chk.eq(dev.get_u8(OP.GET_SUBHARM_SELECT), saved_mode, "pre-test select mode restored")
+    chk.eq(dev.get_u8(OP.GET_SUBHARM_LINK), saved_link, "pre-test link restored")

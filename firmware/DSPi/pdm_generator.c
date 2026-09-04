@@ -498,26 +498,20 @@ static void __not_in_flash_func(eq_worker_loop)() {
                                 CORE1_EQ_FIRST_OUTPUT / 2, CORE1_EQ_LAST_OUTPUT / 2,
                                 buf_out, sample_count);
 
+        // Subharmonic synthesizer for Core 1's outputs, pre-crossover and
+        // ahead of psybass (snapshot comes from core1_eq_work so both cores
+        // share one view per packet).
+        subharm_process_outputs(sh_coeffs, sh_mask, core1_eq_work.subharm_flags,
+                                core1_eq_work.subharm_phase, CORE1_EQ_FIRST_OUTPUT, CORE1_EQ_LAST_OUTPUT,
+                                buf_out, sample_count);
+
         // Process EQ + gain for outputs assigned to Core 1
         extern MatrixMixer matrix_mixer;
         for (int out = CORE1_EQ_FIRST_OUTPUT; out <= CORE1_EQ_LAST_OUTPUT; out++) {
             if (!matrix_mixer.outputs[out].enabled) {
                 loudness_reset_output_state(&loudness_output_state[out]);
                 psybass_reset_output_state(&psybass_output_state[out]);
-                subharm_reset_output_state(&subharm_output_state[out]);
                 continue;
-            }
-
-            // Subharmonic synthesizer, pre-crossover and ahead of psybass (same
-            // predicate as Core 0 in audio_pipeline.c; snapshot comes from
-            // core1_eq_work so both cores share one view per packet).
-            if (sh_coeffs && ((sh_mask >> out) & 1u)
-                && !matrix_mixer.outputs[out].mute
-                && !(siggen_raw_mask & (1u << out))) {
-                subharm_process_output_block(sh_coeffs, &subharm_output_state[out],
-                                             buf_out[out], sample_count);
-            } else {
-                subharm_reset_output_state(&subharm_output_state[out]);
             }
 
             // Psychoacoustic bass on masked outputs, pre-crossover (same
@@ -700,26 +694,20 @@ static void __not_in_flash_func(eq_worker_loop)() {
                                 CORE1_EQ_FIRST_OUTPUT / 2, CORE1_EQ_LAST_OUTPUT / 2,
                                 buf_out, sample_count);
 
+        // Subharmonic synthesizer for Core 1's outputs, pre-crossover and
+        // ahead of psybass (snapshot comes from core1_eq_work so both cores
+        // share one view per packet).
+        subharm_process_outputs(sh_coeffs, sh_mask, core1_eq_work.subharm_flags,
+                                core1_eq_work.subharm_phase, CORE1_EQ_FIRST_OUTPUT, CORE1_EQ_LAST_OUTPUT,
+                                buf_out, sample_count);
+
         // Process EQ + gain for outputs assigned to Core 1
         extern MatrixMixer matrix_mixer;
         for (int out = CORE1_EQ_FIRST_OUTPUT; out <= CORE1_EQ_LAST_OUTPUT; out++) {
             if (!matrix_mixer.outputs[out].enabled) {
                 loudness_reset_output_state(&loudness_output_state[out]);
                 psybass_reset_output_state(&psybass_output_state[out]);
-                subharm_reset_output_state(&subharm_output_state[out]);
                 continue;
-            }
-
-            // Subharmonic synthesizer, pre-crossover and ahead of psybass (same
-            // predicate as Core 0 in audio_pipeline.c; snapshot comes from
-            // core1_eq_work so both cores share one view per packet).
-            if (sh_coeffs && ((sh_mask >> out) & 1u)
-                && !matrix_mixer.outputs[out].mute
-                && !(siggen_raw_mask & (1u << out))) {
-                subharm_process_output_block(sh_coeffs, &subharm_output_state[out],
-                                             buf_out[out], sample_count);
-            } else {
-                subharm_reset_output_state(&subharm_output_state[out]);
             }
 
             // Psychoacoustic bass on masked outputs, pre-crossover (same

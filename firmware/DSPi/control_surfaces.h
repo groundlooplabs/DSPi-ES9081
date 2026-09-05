@@ -91,7 +91,8 @@
  *
  * Caps v14 adds the subharmonic synthesizer nouns (57-60) and caps v15 the
  * rest of its parameters (61-67: third band, selectivity mode/depth/hold, sub
- * ceiling, pair link, solo).  Noun additions only; no structure sizes change.
+ * ceiling, pair link, solo).  Caps v16 widens the band-level nouns to +12 dB.
+ * Noun additions and range changes only; no structure sizes change.
  *
  * See Documentation/Features/control_surfaces_spec.md.
  */
@@ -197,11 +198,11 @@ typedef enum {
                                  // page's item, resolved at event time
     // --- caps v14 additions ---
     CS_NOUN_SUBHARM        = 57, // bool (subharmonic synthesizer enable)
-    CS_NOUN_SUBHARM_LOW    = 58, // continuous dB -30..+6 (24-36 Hz band level)
-    CS_NOUN_SUBHARM_HIGH   = 59, // continuous dB -30..+6 (36-56 Hz band level)
+    CS_NOUN_SUBHARM_LOW    = 58, // continuous dB -30..+12 (24-36 Hz band level)
+    CS_NOUN_SUBHARM_HIGH   = 59, // continuous dB -30..+12 (36-56 Hz band level)
     CS_NOUN_SUBHARM_BOOST  = 60, // continuous dB 0..+6 (LF boost bell)
     // --- caps v15 additions ---
-    CS_NOUN_SUBHARM_TOP    = 61, // continuous dB -30..+6 (56-80 Hz band level)
+    CS_NOUN_SUBHARM_TOP    = 61, // continuous dB -30..+12 (56-80 Hz band level)
     CS_NOUN_SUBHARM_SELECT = 62, // enum 0..2 (all / percussive / sustained)
     CS_NOUN_SUBHARM_DEPTH  = 63, // continuous percent 0..100 (selectivity depth)
     CS_NOUN_SUBHARM_HOLD   = 64, // continuous ms 50..400 (selectivity hold)
@@ -576,7 +577,7 @@ typedef struct __attribute__((packed)) {
 } CsTypeDesc;
 
 typedef struct __attribute__((packed)) {
-    uint8_t  caps_version; // capability format version (15); see the file
+    uint8_t  caps_version; // capability format version (16); see the file
                            // header for what each version added
     uint8_t  max_bindings; // CS_MAX_BINDINGS
     uint8_t  type_count;   // CS_TYPE_COUNT (table follows, index = CsType)

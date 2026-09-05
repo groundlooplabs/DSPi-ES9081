@@ -1216,7 +1216,7 @@ The divider is a peak follower (40 ms decay) plus a hysteresis comparator: it ar
 The kernel exists once, in `subharm.c`, written against a number-type abstraction in `subharm.h` (`sh_num_t` with `sh_mul`, `sh_half`, `sh_twice`, `sh_quarter`, `sh_abs`, `sh_band_limit`, `sh_ratio`). Every filter is a TPT state-variable filter; the corners are far below Fs/7.5 at every rate, so the SVF form is both cheaper (three multiplies per stage once the lowpass update is folded to `v2 = ic2 + g v1`, with LP and HP for free) and more precise than a direct-form biquad.
 
 - **RP2350:** `sh_num_t` is float; the helpers are plain float arithmetic.
-- **RP2040:** `sh_num_t` is Q28 `int32_t`; `sh_mul` is `fast_mul_q28`. The SVF's low-frequency precision matters here: an additive rounding error in a TDF2 biquad at 48 Hz is amplified by roughly 1/omega^2 (about 25 000x) into a DC offset, whereas in the TPT SVF it is amplified by roughly 1/g (about 300x), so the SVF holds a 30 dB better DC floor with the truncating multiplier. `sh_input_limit` clamps the sub path's input to +/-3.0, `sh_band_limit` each band signal to +/-1.0 before its divider and `sh_sub_limit` the sub sum to +/-2.0, with the boost ceiling at +6 dB, so no stored value can wrap `fast_mul_q28` past +/-8.0 on inputs up to +9.5 dBFS (the dry path is not clamped). `sh_ratio` (the ceiling gain) normalizes the divisor to 16 bits and uses one 32-bit hardware divide, so the RAM kernel never calls a libgcc 64-bit divide or clz in flash. The host-compiled Q28 kernel matches the float kernel to about -102 dBFS with every stage on.
+- **RP2040:** `sh_num_t` is Q28 `int32_t`; `sh_mul` is `fast_mul_q28`. The SVF's low-frequency precision matters here: an additive rounding error in a TDF2 biquad at 48 Hz is amplified by roughly 1/omega^2 (about 25 000x) into a DC offset, whereas in the TPT SVF it is amplified by roughly 1/g (about 300x), so the SVF holds a 30 dB better DC floor with the truncating multiplier. `sh_input_limit` clamps the sub path's input to +/-3.0, `sh_band_limit` each band signal to +/-1.0 before its divider, `sh_band_out_limit` each band's scaled sub to +/-2.5 and `sh_sub_limit` the sub sum to +/-2.0, with the boost ceiling at +6 dB, so no stored value can wrap `fast_mul_q28` past +/-8.0 on inputs up to +9.5 dBFS even with three bands at +12 dB (the dry path is not clamped). `sh_ratio` (the ceiling gain) normalizes the divisor to 16 bits and uses one 32-bit hardware divide, so the RAM kernel never calls a libgcc 64-bit divide or clz in flash. The host-compiled Q28 kernel matches the float kernel to about -102 dBFS with every stage on.
 
 The block kernel `subharm_process_block` is an out-of-line `DSP_TIME_CRITICAL` function in `subharm.c`, shared by both cores, rather than a header inline like psybass: inlining it at the call sites cost several KB of RAM code. Its full-rate loop keeps the anti-alias SVF, interpolator and bell state in registers; the low-rate work (`subharm_low_rate_tick`, `sh_band_tick`, `sh_select_gain`) is out-of-line RAM code working through the state struct, where the memory traffic is cheap and inlining three band ticks into the loop cost 4 KB. The RAM code totals about 3 KB. A skipped band (level at the -30 dB floor), gate (mode ALL), ceiling (0 dB) or bell (0 dB, or any setting while soloed) has its state cleared once per block so re-enabling it is transient-free.
 
@@ -1227,11 +1227,11 @@ One global config (`SubharmConfig`) applied to the output channels selected by `
 | Parameter | Type | Range | Default | Description |
 |-----------|------|-------|---------|-------------|
 | enabled | bool | 0/1 | false | Enable/disable the effect |
-| low_db | float | -30..+6 dB | 0 | 24-36 Hz sub level; -30 = band off (skipped) |
-| high_db | float | -30..+6 dB | 0 | 36-56 Hz sub level; -30 = band off (skipped) |
+| low_db | float | -30..+12 dB | 0 | 24-36 Hz sub level; -30 = band off (skipped) |
+| high_db | float | -30..+12 dB | 0 | 36-56 Hz sub level; -30 = band off (skipped) |
 | boost_db | float | 0..+6 dB | 0 | LF boost bell (70 Hz, Q 0.9) after the sum; 0 = stage skipped |
 | output_mask | uint16 | 0x0000-0xFFFF | 0xFFFF | Bit k: process output channel k |
-| top_db | float | -30..+6 dB | -30 (off) | 56-80 Hz sub level from 112-160 Hz program; -30 = band off |
+| top_db | float | -30..+12 dB | -30 (off) | 56-80 Hz sub level from 112-160 Hz program; -30 = band off |
 | select_mode | uint8 | 0..2 | 0 (all) | Favour all / percussive / sustained bass material |
 | select_depth | float | 0..100 % | 100 | How far the unfavoured material is gated; ignored at mode 0 |
 | select_hold_ms | float | 50..400 ms | 150 | Span the selectivity decision is made over; ignored at mode 0 |
@@ -1264,7 +1264,7 @@ Follows the psybass module pattern:
 - **Preset slot V37:** the V30 fields are tail-appended in turn (struct grows a further 20 bytes; `SLOT_DATA_SIZE_V37`), gated on `slot->version >= 37`. V36 slots load the `SUBHARM_DEFAULT_*` values for them. `solo` is not stored.
 - **Vendor commands:** `0x10-0x1F`, `0x2C-0x2F` and `0xA9-0xAE` (SET/GET enable, low, high, boost, mask, top, selectivity mode/depth/hold, ceiling, link, solo; GET headroom and sub meter). 0x10-0x1F were the first application commands allocated inside 0x00-0x1F. Each SET clamps to the parameter range, writes `subharm_config`, and emits a `notify_param_write`. The mask, link and solo SETs do **not** raise `subharm_update_pending` (the pipeline reads them live each packet); every other SET does. Solo has no wire offset, so it emits no notification. See the Vendor Command Reference table.
 - **Sub meter:** `REQ_GET_SUBHARM_METER` (0x1F) returns `NUM_OUTPUT_CHANNELS` uint16 LE values from `subharm_meter_u16()`, a decaying peak of the synthesized sub per output on the same 0..32767 scale as `SystemStatusPacket.peaks`. 18 bytes on RP2350, 10 on RP2040.
-- **Control Surfaces:** caps v14 nouns 57-60 (`SUBHARM`, `SUBHARM_LOW`, `SUBHARM_HIGH`, `SUBHARM_BOOST`) and caps v15 nouns 61-67 (`SUBHARM_TOP`, `SUBHARM_SELECT`, `SUBHARM_DEPTH`, `SUBHARM_HOLD`, `SUBHARM_CEILING`, `SUBHARM_LINK`, `SUBHARM_SOLO`).
+- **Control Surfaces:** caps v14 nouns 57-60 (`SUBHARM`, `SUBHARM_LOW`, `SUBHARM_HIGH`, `SUBHARM_BOOST`) and caps v15 nouns 61-67 (`SUBHARM_TOP`, `SUBHARM_SELECT`, `SUBHARM_DEPTH`, `SUBHARM_HOLD`, `SUBHARM_CEILING`, `SUBHARM_LINK`, `SUBHARM_SOLO`). Caps v16 (2026-09-05) widens the band-level nouns to -30..+12 dB.
 
 ---
 
@@ -2529,7 +2529,7 @@ format version is unchanged by this feature.
 ---
 
 ## Control Surfaces (User-Wired Physical Controls)
-*Last updated: 2026-09-04 (caps v15: subharmonic synthesizer nouns 61-67; 2026-09-02 caps v14: subharmonic synthesizer nouns 57-60; 2026-08-24: input-source stepping skips unselectable sources; caps v13: display level bars; caps v12: per-LED PWM brightness ceiling; caps v11: display line alignment and edit markers; caps v10: I2C display component, IR group support, nouns 53-56, commands 0x27-0x2B, directory V19)*
+*Last updated: 2026-09-05 (caps v16: subharmonic band-level nouns widened to +12 dB; 2026-09-04 caps v15: subharmonic synthesizer nouns 61-67; 2026-09-02 caps v14: subharmonic synthesizer nouns 57-60; 2026-08-24: input-source stepping skips unselectable sources; caps v13: display level bars; caps v12: per-LED PWM brightness ceiling; caps v11: display line alignment and edit markers; caps v10: I2C display component, IR group support, nouns 53-56, commands 0x27-0x2B, directory V19)*
 
 User-wired push buttons, toggle switches, potentiometers, quadrature rotary
 encoders, plain indicator LEDs, PWM-dimmed LEDs, an IR remote receiver, and an
@@ -2696,6 +2696,10 @@ taking `noun_count` to 68. The hold noun's caps range stops at 127 ms because
 the documented 50..400 ms, the same limitation `CS_LOUDNESS_INTENSITY_MAX`
 already carries. Display labels are "Sub 56-80", "Sub Select", "Sub Depth",
 "Sub Hold", "Sub Ceil", "Sub Link" and "Sub Solo".
+
+**Caps v16** (2026-09-05) widens the three subharmonic band-level nouns
+(`SUBHARM_LOW`, `SUBHARM_HIGH`, `SUBHARM_TOP`) from -30..+6 to -30..+12 dB.
+Range change only; no nouns, structures or stored config change.
 
 ### File layout
 
@@ -3206,16 +3210,16 @@ RP2040 like the rest of the engine.
 |---------|------|-----------|-------------|
 | REQ_SET_SUBHARM | 0x10 | OUT | Enable/disable the subharmonic synthesizer (1 byte, 0/1) |
 | REQ_GET_SUBHARM | 0x11 | IN | Get subharm enabled state (1 byte) |
-| REQ_SET_SUBHARM_LOW | 0x12 | OUT | Set 24-36 Hz sub level (4-byte LE IEEE754 float, -30..+6 dB, clamped; -30 = band off) |
+| REQ_SET_SUBHARM_LOW | 0x12 | OUT | Set 24-36 Hz sub level (4-byte LE IEEE754 float, -30..+12 dB, clamped; -30 = band off) |
 | REQ_GET_SUBHARM_LOW | 0x13 | IN | Get 24-36 Hz sub level (4-byte float) |
-| REQ_SET_SUBHARM_HIGH | 0x14 | OUT | Set 36-56 Hz sub level (4-byte float, -30..+6 dB, clamped; -30 = band off) |
+| REQ_SET_SUBHARM_HIGH | 0x14 | OUT | Set 36-56 Hz sub level (4-byte float, -30..+12 dB, clamped; -30 = band off) |
 | REQ_GET_SUBHARM_HIGH | 0x15 | IN | Get 36-56 Hz sub level (4-byte float) |
 | REQ_SET_SUBHARM_BOOST | 0x16 | OUT | Set LF boost bell gain (4-byte float, 0..+6 dB, clamped) |
 | REQ_GET_SUBHARM_BOOST | 0x17 | IN | Get LF boost bell gain (4-byte float) |
 | REQ_SET_SUBHARM_MASK | 0x18 | OUT | Set output mask (2-byte LE uint16; read live, no recompute) |
 | REQ_GET_SUBHARM_MASK | 0x19 | IN | Get output mask (2-byte LE uint16) |
 | REQ_GET_SUBHARM_HEADROOM | 0x1A | IN | Get the preamp headroom the current subharm config needs (4-byte float dB, 0 while disabled; computed on request) |
-| REQ_SET_SUBHARM_TOP | 0x1B | OUT | Set 56-80 Hz sub level (4-byte float, -30..+6 dB, clamped; -30 = band off) |
+| REQ_SET_SUBHARM_TOP | 0x1B | OUT | Set 56-80 Hz sub level (4-byte float, -30..+12 dB, clamped; -30 = band off) |
 | REQ_GET_SUBHARM_TOP | 0x1C | IN | Get 56-80 Hz sub level (4-byte float) |
 | REQ_SET_SUBHARM_SELECT | 0x1D | OUT | Set selectivity mode (1 byte: 0 all, 1 percussive, 2 sustained; above 2 clamps to 2) |
 | REQ_GET_SUBHARM_SELECT | 0x1E | IN | Get selectivity mode (1 byte) |

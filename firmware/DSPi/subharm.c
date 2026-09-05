@@ -244,7 +244,7 @@ sh_num_t sh_band_tick(const SubharmCoeffs *c, const SubharmBandCoeffs *bc,
         bs->align = l + v;
         sub = sh_twice(l) - sub;
     }
-    return sh_mul(bc->gain, sub);
+    return sh_band_out_limit(sh_mul(bc->gain, sub));
 }
 
 // One low-rate step on the anti-aliased input: band split, three dividers,

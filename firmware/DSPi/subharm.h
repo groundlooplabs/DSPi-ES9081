@@ -62,7 +62,7 @@
 // processing is skipped.  Level ceilings plus the Q28 input, band and sub
 // clamps below keep every stored RP2040 value inside +/-8.0.
 #define SUBHARM_LEVEL_MIN      -30.0f   // band level (dB); floor = band off
-#define SUBHARM_LEVEL_MAX        6.0f
+#define SUBHARM_LEVEL_MAX       12.0f
 #define SUBHARM_BOOST_MIN        0.0f   // LF boost (dB); 0 = stage skipped
 #define SUBHARM_BOOST_MAX        6.0f
 
@@ -131,6 +131,7 @@ static inline sh_num_t sh_quarter(sh_num_t v)         { return 0.25f * v; }
 static inline sh_num_t sh_abs(sh_num_t v)             { return fabsf(v); }
 static inline sh_num_t sh_band_limit(sh_num_t v)      { return v; }
 static inline sh_num_t sh_input_limit(sh_num_t v)     { return v; }
+static inline sh_num_t sh_band_out_limit(sh_num_t v)  { return v; }
 static inline sh_num_t sh_sub_limit(sh_num_t v)       { return v; }
 static inline sh_num_t sh_ratio(sh_num_t a, sh_num_t b) { return a / b; }
 #else
@@ -150,10 +151,15 @@ static inline sh_num_t sh_band_limit(sh_num_t v) {
     const int32_t one = 1 << FILTER_SHIFT;
     return v > one ? one : (v < -one ? -one : v);
 }
-// Sub-path input clamp (+/-3.0) and sub-sum clamp (+/-2.0): hot inputs past
-// these would wrap the split filters or the bell; the dry path is unclamped.
+// Sub-path input clamp (+/-3.0), per-band clamp (+/-2.5, three bands at
+// +12 dB on a hot input would otherwise wrap the sum) and sub-sum clamp
+// (+/-2.0).  The dry path is unclamped.
 static inline sh_num_t sh_input_limit(sh_num_t v) {
     const int32_t lim = 3 << FILTER_SHIFT;
+    return v > lim ? lim : (v < -lim ? -lim : v);
+}
+static inline sh_num_t sh_band_out_limit(sh_num_t v) {
+    const int32_t lim = 5 << (FILTER_SHIFT - 1);
     return v > lim ? lim : (v < -lim ? -lim : v);
 }
 static inline sh_num_t sh_sub_limit(sh_num_t v) {

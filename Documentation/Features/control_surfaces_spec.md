@@ -1,6 +1,6 @@
 # Control Surfaces (User-Wired Physical Controls and Indicators)
 
-*Firmware capability format version: 14*
+*Firmware capability format version: 16*
 *Config (flash) version: 2; IR config version: 2*
 *Directory version: 18*
 
@@ -283,7 +283,7 @@ the firmware stores and what `REQ_GET_ALL_PARAMS` does **not** contain.
 
 | Off | Size | Field | Meaning |
 |----|------|-------|---------|
-| 0 | 1 | `caps_version` | capability format version (14) |
+| 0 | 1 | `caps_version` | capability format version (16) |
 | 1 | 1 | `max_bindings` | `CS_MAX_BINDINGS` (16) |
 | 2 | 1 | `type_count` | `CS_TYPE_COUNT` (9); the type table has this many entries, indexed by `CsType` |
 | 3 | 1 | `noun_count` | `CS_NOUN_COUNT` (61) |

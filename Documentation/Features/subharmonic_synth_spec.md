@@ -96,7 +96,7 @@ Master enable. When disabled the coefficient pointer is unpublished and per-outp
 | Property | Value |
 |----------|-------|
 | **Type** | `float` |
-| **Range** | -30.0 to +6.0 (dB); -30.0 = band off |
+| **Range** | -30.0 to +12.0 (dB); -30.0 = band off |
 | **Default** | 0.0 |
 | **SET command** | `0x12` (`REQ_SET_SUBHARM_LOW`) |
 | **GET command** | `0x13` (`REQ_GET_SUBHARM_LOW`) |
@@ -109,7 +109,7 @@ Level of the 24 to 36 Hz sub, synthesized from program content in 48 to 72 Hz. A
 | Property | Value |
 |----------|-------|
 | **Type** | `float` |
-| **Range** | -30.0 to +6.0 (dB); -30.0 = band off |
+| **Range** | -30.0 to +12.0 (dB); -30.0 = band off |
 | **Default** | 0.0 |
 | **SET command** | `0x14` (`REQ_SET_SUBHARM_HIGH`) |
 | **GET command** | `0x15` (`REQ_GET_SUBHARM_HIGH`) |
@@ -177,7 +177,7 @@ lp2, hp2  = 2nd-order Butterworth magnitudes; bell = the LF boost magnitude (1 w
 
 With the ceiling on, the reading is the smallest headroom H such that an input at -H dBFS cannot exceed full scale, found by bisection on the input level (the ceiling is an absolute level, so it only bites once the sub actually reaches it; simply capping the sub in the relative bound would under-report). Selectivity and the pair link can only lower the sub (gate weights are at most 1, and the mono sum is at most the larger channel), so they never raise the bound. The ceiling's few-millisecond onset overshoot is not in the bound; it is covered by the 1 to 2 dB conservatism below. Host check with the C kernel: freeing the reported H and sweeping 24 to 300 Hz at 0 to -40 dBFS never exceeds full scale at any ceiling.
 
-Components at different frequencies are summed as amplitudes (worst-case phase), so the bound is conservative by 1 to 2 dB on real tones. Offline verification against a model of the kernel: one band at 0 dB reads 4.2 dB (measured worst 3.3 dB); both bands at 0 dB read 6.3 dB (measured 4.4 dB); everything at +6 dB reads 13.5 dB (measured 11.2 dB); the bell alone at +6 dB reads 6.0 dB (measured 6.0 dB). The bound never reads below the measured peak.
+Components at different frequencies are summed as amplitudes (worst-case phase), so the bound is conservative by 1 to 2 dB on real tones. Band levels reach +12 dB: at that setting the synthesized octave sits well above the bass that produced it, which is the intent for club and cinema use and for driving the ceiling as a sub maximizer, and the headroom reading grows accordingly (about 19 dB with everything at +12 dB and the bell at +6 dB). Offline verification against a model of the kernel: one band at 0 dB reads 4.2 dB (measured worst 3.3 dB); both bands at 0 dB read 6.3 dB (measured 4.4 dB); everything at +6 dB reads 13.5 dB (measured 11.2 dB); the bell alone at +6 dB reads 6.0 dB (measured 6.0 dB). The bound never reads below the measured peak.
 
 Because the divider preserves the band amplitude and every other stage is linear, a preamp cut of X dB ahead of the effect lowers the synthesized sub by exactly X dB as well. Lowering the per-channel preamp on the masked outputs' sources by the reported amount is therefore an exact correction, unlike psybass whose drive and clipper respond nonlinearly to level.
 
@@ -186,7 +186,7 @@ Because the divider preserves the band amplitude and every other stage is linear
 | Property | Value |
 |----------|-------|
 | **Type** | `float` |
-| **Range** | -30.0 to +6.0 (dB); -30.0 = band off |
+| **Range** | -30.0 to +12.0 (dB); -30.0 = band off |
 | **Default** | -30.0 (off) |
 | **SET command** | `0x1B` (`REQ_SET_SUBHARM_TOP`) |
 | **GET command** | `0x1C` (`REQ_GET_SUBHARM_TOP`) |
@@ -289,7 +289,7 @@ A decaying peak of the synthesized sub that was mixed into each output, on the s
 
 Subharm uses the standard DSPi vendor command surface, so it is reachable over every control transport (USB EP0, UART, I2C target, control surfaces engine) with the same command bytes. These are the first application commands allocated inside 0x00 to 0x1F; 0x01 remains the Microsoft OS descriptor vendor code and is intercepted before the dispatcher. The block occupies 0x10 to 0x1F, 0x2C to 0x2F and 0xA9 to 0xAE.
 
-**Control Surfaces** (caps v15+): eleven front-panel nouns map onto these commands: `SUBHARM` (57, enable), `SUBHARM_LOW` (58), `SUBHARM_HIGH` (59), `SUBHARM_BOOST` (60), `SUBHARM_TOP` (61), `SUBHARM_SELECT` (62), `SUBHARM_DEPTH` (63), `SUBHARM_HOLD` (64), `SUBHARM_CEILING` (65), `SUBHARM_LINK` (66), `SUBHARM_SOLO` (67). Nouns 57-60 are caps v14; 61-67 are caps v15. The output mask, the headroom reading and the sub meter stay host-only. The hold noun's front-panel span stops at 127 ms because the caps table encodes ranges as signed 8.8 fixed point; the command itself still accepts the full 50 to 400 ms. See `control_surfaces_spec.md` sections 4.3 and 5.
+**Control Surfaces** (caps v15+): eleven front-panel nouns map onto these commands: `SUBHARM` (57, enable), `SUBHARM_LOW` (58), `SUBHARM_HIGH` (59), `SUBHARM_BOOST` (60), `SUBHARM_TOP` (61), `SUBHARM_SELECT` (62), `SUBHARM_DEPTH` (63), `SUBHARM_HOLD` (64), `SUBHARM_CEILING` (65), `SUBHARM_LINK` (66), `SUBHARM_SOLO` (67). Nouns 57-60 are caps v14; 61-67 are caps v15; caps v16 widens the band-level nouns to +12 dB. The output mask, the headroom reading and the sub meter stay host-only. The hold noun's front-panel span stops at 127 ms because the caps table encodes ranges as signed 8.8 fixed point; the command itself still accepts the full 50 to 400 ms. See `control_surfaces_spec.md` sections 4.3 and 5.
 
 ### USB (primary transport)
 
@@ -302,16 +302,16 @@ Subharm uses the standard DSPi vendor command surface, so it is reachable over e
 |---------|-----------|---------|---------|
 | 0x10 | SET | 1 byte bool | Enable/disable |
 | 0x11 | GET | 1 byte bool | Enabled state |
-| 0x12 | SET | 4-byte float | 24-36 Hz band level (dB, clamps -30..+6; -30 = off) |
+| 0x12 | SET | 4-byte float | 24-36 Hz band level (dB, clamps -30..+12; -30 = off) |
 | 0x13 | GET | 4-byte float | 24-36 Hz band level |
-| 0x14 | SET | 4-byte float | 36-56 Hz band level (dB, clamps -30..+6; -30 = off) |
+| 0x14 | SET | 4-byte float | 36-56 Hz band level (dB, clamps -30..+12; -30 = off) |
 | 0x15 | GET | 4-byte float | 36-56 Hz band level |
 | 0x16 | SET | 4-byte float | LF boost (dB, clamps 0..+6) |
 | 0x17 | GET | 4-byte float | LF boost |
 | 0x18 | SET | 2-byte uint16 LE | Output mask |
 | 0x19 | GET | 2-byte uint16 LE | Output mask |
 | 0x1A | GET | 4-byte float | Headroom to free (dB, 0 while disabled) |
-| 0x1B | SET | 4-byte float | 56-80 Hz band level (dB, clamps -30..+6; -30 = off) |
+| 0x1B | SET | 4-byte float | 56-80 Hz band level (dB, clamps -30..+12; -30 = off) |
 | 0x1C | GET | 4-byte float | 56-80 Hz band level |
 | 0x1D | SET | 1 byte | Selectivity mode (clamps to 0..2) |
 | 0x1E | GET | 1 byte | Selectivity mode |
@@ -390,7 +390,7 @@ On bulk SET (0xA1), all subharm fields are applied and coefficients recompute au
 
 ### Typical UI
 
-Enable; two sliders labelled "24-36 Hz" and "36-56 Hz" (-30 to +6 dB, floor shown as "Off"); an "LF Boost" slider (0 to +6 dB); per-output checkboxes building the mask; a headroom readout with an apply button.
+Enable; two sliders labelled "24-36 Hz" and "36-56 Hz" (-30 to +12 dB, floor shown as "Off"); an "LF Boost" slider (0 to +6 dB); per-output checkboxes building the mask; a headroom readout with an apply button.
 
 ### Suggested starting points
 
@@ -424,7 +424,7 @@ There is no capability bit. Detect support by firmware version, by `format_versi
 - **Sample rate changes.** Coefficients recompute automatically for 44.1/48/96 kHz.
 - **Very quiet input.** The envelope-relative threshold keeps the divider working at any level. Below the noise floor the divider toggles on noise, but its output is that noise and is inaudible.
 - **Sub-48 Hz program content.** The 48 Hz highpass keeps real sub-bass and DC out of the dividers, so a 30 Hz note does not produce a 15 Hz sub-sub.
-- **RP2040 fixed point.** The sub path's input is clamped to +/-3.0, each band signal to +/-1.0 before its divider, and the sub sum to +/-2.0, with the boost ceiling at +6 dB, so no stored value can wrap `fast_mul_q28` past +/-8.0 on inputs up to +9.5 dBFS. The dry path is not clamped. Inputs driven harder than that by preamp and matrix gain are in the same regime as the PEQ.
+- **RP2040 fixed point.** The sub path's input is clamped to +/-3.0, each band signal to +/-1.0 before its divider, each band's scaled sub to +/-2.5, and the sub sum to +/-2.0, with the boost ceiling at +6 dB, so no stored value can wrap `fast_mul_q28` past +/-8.0 on inputs up to +9.5 dBFS even with three bands at +12 dB. The dry path is not clamped. Inputs driven harder than that by preamp and matrix gain are in the same regime as the PEQ.
 - **CPU cost.** Per processed output: one SVF, the interpolator and the bell at full rate, and the split, dividers, gates and ceiling at one sixth of the rate. About 12 multiplies per sample with the default two bands and roughly 16 with three bands, selectivity and ceiling on, against 25 for the original full-rate kernel. A linked pair costs one kernel plus one extra bell. Masked-off outputs and skipped bands, gate or bell cost nothing beyond a state clear.
 
 ---
@@ -446,6 +446,6 @@ There is no capability bit. Detect support by firmware version, by `format_versi
 | Dual-core | Coefficient pointer + mask + flags (link, solo) + decimation phase snapshotted once per packet into `Core1EqWork` (`subharm_coeffs` / `subharm_mask` / `subharm_flags` / `subharm_phase`) |
 | Headroom | `subharm_headroom_db()`: pure function of the config, analog-prototype magnitudes on a 37-point eighth-octave grid (16 to 362 Hz); with a ceiling, bisection on the input level for the smallest safe headroom; computed on each 0x1A GET |
 | Latency | Dry path untouched; the sub lags by one low-rate period (6 samples at 48 kHz) on every processed output alike; inter-slot alignment preserved by construction |
-| Versions | Vendor commands 0x10-0x1F, 0x2C-0x2F and 0xA9-0xAE; wire format V30; preset slot V37; control surfaces caps v15 (nouns 57-67) |
+| Versions | Vendor commands 0x10-0x1F, 0x2C-0x2F and 0xA9-0xAE; wire format V30; preset slot V37; control surfaces caps v16 (nouns 57-67; band levels to +12 dB) |
 | RAM | about 1.2 KB (RP2040) / 1.9 KB (RP2350) of state and coefficient buffers, plus about 3 KB of RAM-resident code |
 | Status | Implemented, verified against an offline model of the kernel (the C float kernel matches the model to 6e-7, output is bit-identical across block sizes, Q28 error about -102 dBFS); hardware listening test pending |

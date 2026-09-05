@@ -161,12 +161,12 @@ def subharm_enable_bool(dev, profile, chk):
 
 @test("dynamics", mutating=True)
 def subharm_level_clamps(dev, profile, chk):
-    """0x12-0x17 band levels clamp to [-30,+6], boost to [0,+6]."""
+    """0x12-0x17 band levels clamp to [-30,+12], boost to [0,+6]."""
     for name, s, g in (("low", OP.SET_SUBHARM_LOW, OP.GET_SUBHARM_LOW),
                        ("high", OP.SET_SUBHARM_HIGH, OP.GET_SUBHARM_HIGH)):
         float_roundtrip(dev, chk, s, g, -6.0, label=f"{name} -6")
         float_clamp(dev, chk, s, g, -99.0, -30.0, label=f"{name} low clamp")
-        float_clamp(dev, chk, s, g, 40.0, 6.0, label=f"{name} high clamp")
+        float_clamp(dev, chk, s, g, 40.0, 12.0, label=f"{name} high clamp")
     float_roundtrip(dev, chk, OP.SET_SUBHARM_BOOST, OP.GET_SUBHARM_BOOST, 3.0, label="boost 3")
     float_clamp(dev, chk, OP.SET_SUBHARM_BOOST, OP.GET_SUBHARM_BOOST, -5.0, 0.0, label="boost low clamp")
     float_clamp(dev, chk, OP.SET_SUBHARM_BOOST, OP.GET_SUBHARM_BOOST, 20.0, 6.0, label="boost high clamp")
@@ -204,11 +204,11 @@ def subharm_headroom(dev, profile, chk):
 
 @test("dynamics", mutating=True)
 def subharm_top_clamp(dev, profile, chk):
-    """0x1B/0x1C third band level clamps to [-30,+6]."""
+    """0x1B/0x1C third band level clamps to [-30,+12]."""
     prev = dev.get_f32(OP.GET_SUBHARM_TOP)
     float_roundtrip(dev, chk, OP.SET_SUBHARM_TOP, OP.GET_SUBHARM_TOP, -12.0, label="top -12")
     float_clamp(dev, chk, OP.SET_SUBHARM_TOP, OP.GET_SUBHARM_TOP, -99.0, -30.0, label="top low clamp")
-    float_clamp(dev, chk, OP.SET_SUBHARM_TOP, OP.GET_SUBHARM_TOP, 40.0, 6.0, label="top high clamp")
+    float_clamp(dev, chk, OP.SET_SUBHARM_TOP, OP.GET_SUBHARM_TOP, 40.0, 12.0, label="top high clamp")
     dev.set_f32(OP.SET_SUBHARM_TOP, prev)
 
 

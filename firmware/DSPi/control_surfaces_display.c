@@ -587,6 +587,7 @@ static const char *const s_noun_label[CS_NOUN_COUNT] = {
     [CS_NOUN_SUBHARM_SELECT] = "Sub Select",[CS_NOUN_SUBHARM_DEPTH] = "Sub Depth",
     [CS_NOUN_SUBHARM_HOLD] = "Sub Hold",   [CS_NOUN_SUBHARM_CEILING] = "Sub Ceil",
     [CS_NOUN_SUBHARM_LINK] = "Sub Link",   [CS_NOUN_SUBHARM_SOLO] = "Sub Solo",
+    [CS_NOUN_AUX] = "Aux",                 [CS_NOUN_AUX_LEVEL] = "Aux",
 };
 
 static const char *const s_input_label[] = {"USB", "SPDIF", "I2S", "ADAT",
@@ -786,6 +787,16 @@ static void disp_format_label_ex(const CsDisplayPage *p, char *out, size_t n,
             snprintf(out, n, tight ? "C%dB%d %s" : "Ch%d B%d %s",
                      p->target + 1, p->index + 1, base);
             break;
+        case CS_TARGET_AUX: {
+            // The user's name replaces "Aux N"; the level page keeps a suffix
+            // so both pages of one output stay distinguishable.
+            const CsAuxCfg *c = control_surfaces_get_aux_cfg(p->target);
+            const char *sfx = (p->noun == CS_NOUN_AUX_LEVEL)
+                            ? (tight ? " Lvl" : " Level") : "";
+            if (c && c->name[0]) snprintf(out, n, "%s%s", c->name, sfx);
+            else snprintf(out, n, "%s %d%s", base, p->target + 1, sfx);
+            break;
+        }
         default:
             snprintf(out, n, "%s", base);
             break;

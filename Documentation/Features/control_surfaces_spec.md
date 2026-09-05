@@ -1,8 +1,8 @@
 # Control Surfaces (User-Wired Physical Controls and Indicators)
 
-*Firmware capability format version: 16*
+*Firmware capability format version: 17*
 *Config (flash) version: 2; IR config version: 2*
-*Directory version: 18*
+*Directory version: 20*
 
 This document is the complete, self-contained specification for the DSPi
 Control Surfaces feature: user-wired push buttons, toggle switches,
@@ -283,10 +283,10 @@ the firmware stores and what `REQ_GET_ALL_PARAMS` does **not** contain.
 
 | Off | Size | Field | Meaning |
 |----|------|-------|---------|
-| 0 | 1 | `caps_version` | capability format version (16) |
+| 0 | 1 | `caps_version` | capability format version (17) |
 | 1 | 1 | `max_bindings` | `CS_MAX_BINDINGS` (16) |
 | 2 | 1 | `type_count` | `CS_TYPE_COUNT` (9); the type table has this many entries, indexed by `CsType` |
-| 3 | 1 | `noun_count` | `CS_NOUN_COUNT` (61) |
+| 3 | 1 | `noun_count` | `CS_NOUN_COUNT` (70) |
 | 4 | 32 | `types[8]` | eight `CsTypeDesc`, one per `CsType` including index 0 (`NONE`, all-zero) |
 | 36 | 1 | `max_ir_commands` | `CS_MAX_IR_COMMANDS` (16) |
 | 37 | 3 | `reserved[3]` | 0 |
@@ -299,6 +299,10 @@ relative to the table end.
 The `CS_TYPE_IR` type descriptor's action mask describes what its
 **commands** may do (the button action set); the container binding itself
 carries `noun = action = 0` (section 2.7).
+
+Caps v17 adds no header field. The auxiliary outputs it introduces are
+discovered from the version byte and counted from `target_count` in the
+descriptors for nouns 68 and 69 (`control_surfaces_aux_spec.md`).
 
 ### 2.5 `CsNounDesc` (12 bytes)
 
@@ -394,7 +398,10 @@ and is not part of `WireBulkParams`.
 
 The caps v9 group and macro commands `0x20`-`0x26` follow the same conventions
 but are documented in `control_surfaces_groups_macros_spec.md`; `REQ_CS_SAVE`
-and `REQ_CS_REVERT` below cover their config too.
+and `REQ_CS_REVERT` below cover their config too. The caps v17 auxiliary
+output commands `0x02`-`0x07` are specified in
+`control_surfaces_aux_spec.md`, and `REQ_CS_SAVE` / `REQ_CS_REVERT` cover the
+aux config too.
 
 | Command | Code | Dir | wValue | wLength / payload | Response |
 |---------|------|-----|--------|-------------------|----------|
@@ -490,6 +497,7 @@ Surfaces extends it from `0x10`.
 | `0x1C` | `CS_STATUS_FLASH_ERROR` | the directory persist failed (`REQ_CS_SAVE`) |
 | `0x1D` | `CS_STATUS_IR_IN_USE` | another slot already holds the IR component (one receiver per device) |
 | `0x1E` | `CS_STATUS_NO_IR` | learn was armed with no live `CS_TYPE_IR` binding |
+| `0x26` | `CS_STATUS_INVALID_AUX` | aux index >= 8 on `REQ_SET_CS_AUX_CFG` (`control_surfaces_aux_spec.md`) |
 
 ### 3.4 Per-slot names (`REQ_SET_CS_NAME` / `REQ_GET_CS_NAME`)
 
@@ -716,6 +724,8 @@ Action-mask groups used below:
 | `SUBHARM_LOW` | 58 | CONT | DB | -30..+6 dB (-30 = band off) | - | CONT-RW |
 | `SUBHARM_HIGH` | 59 | CONT | DB | -30..+6 dB (-30 = band off) | - | CONT-RW |
 | `SUBHARM_BOOST` | 60 | CONT | DB | 0..+6 dB | - | CONT-RW |
+| `AUX` | 68 | BOOL | - | user on/off, no audio meaning | AUX | BOOL-RW |
+| `AUX_LEVEL` | 69 | CONT | PERCENT | 0..100 % | AUX | CONT-RW |
 
 The *effective* legal action set for a (type, noun) pair is the bitwise AND of
 its two masks. Example: an encoder (`STEP` only) on `USER_MUTE` (bool, no
@@ -735,6 +745,7 @@ input channels and 9 outputs, RP2040 has 2 and 5).
 | `CS_TARGET_OUTPUT_CH` | 2 | output channel 0..N-1 | (must be 0) |
 | `CS_TARGET_DSP_CH` | 3 | DSP channel (inputs first, then outputs) | (must be 0) |
 | `CS_TARGET_DSP_BAND` | 4 | DSP channel | filter band |
+| `CS_TARGET_AUX` | 5 | aux output 0..7 | (must be 0) |
 
 Valid bands for `CS_TARGET_DSP_BAND`: PEQ bands `0..channel_band_counts-1`
 (currently 10 per channel), plus, for `FILTER_FREQ` and `FILTER_BYPASS` only,
@@ -807,6 +818,8 @@ target and dispatches it.
 | `PRESET_RELOAD` | `REQ_PRESET_LOAD` (`0x91`, GET, wValue = active slot) | `TRIGGER` reloads the currently active preset from flash via the deferred pipeline-safe path, discarding unsaved live edits. Device-global state (master volume in independent mode, output config, CS bindings) is untouched. |
 | `LOUDNESS_SPL` | `REQ_SET_LOUDNESS_REF` (`0x5A`, float dB SPL) | Reference listening level 40..100 dB SPL: the level at which the ISO 226 compensation reads flat. Lower it and the curve engages sooner as volume drops. |
 | `LOUDNESS_INTENSITY` | `REQ_SET_LOUDNESS_INTENSITY` (`0x5C`, float %) | Compensation depth, 100 % = the full ISO 226 contour difference. The vendor command accepts 0..200 %, but 8.8 percent caps the bindable span at 0..127 %. |
+| `AUX` | `REQ_SET_CS_AUX_STATE` (`0x04`, wValue = `target`, uint8 0/1) | Auxiliary output on/off; a user value with no audio meaning. See `control_surfaces_aux_spec.md`. |
+| `AUX_LEVEL` | `REQ_SET_CS_AUX_LEVEL` (`0x06`, wValue = `target`, uint8 0..100) | Auxiliary output level in whole percent, rounded from the noun value and clamped at 100. |
 
 ### 5.1 Enum stepping detail
 
@@ -952,6 +965,10 @@ so rapid detents on two different filter knobs cannot overwrite each other.
   binding starts "off" and counts `on_delay` from activation if its
   condition is already true. Delays on `IND_LEVEL` or any non-LED type are
   rejected with `CS_STATUS_INVALID_VALUE`.
+- An LED may follow `CS_NOUN_AUX` (`IND_EQUALS`, `value = 1`) to turn a
+  user-defined auxiliary output into a real pin for a relay or amplifier
+  trigger, with `CS_FLAG_INVERT` for active-low modules and the delays above
+  for warm-up or hold-off. See `control_surfaces_aux_spec.md`.
 
 ### 6.6 PWM LEDs (1 GPIO, hardware PWM)
 
@@ -981,6 +998,10 @@ so rapid detents on two different filter knobs cannot overwrite each other.
 - `on_delay`/`off_delay` (6.5) apply to the `IND_EQUALS`/`IND_ABOVE` full-on/off
   actions; they are rejected on `IND_LEVEL` (a continuous level has no boolean
   edge to time).
+- A PWM LED may follow `CS_NOUN_AUX_LEVEL` (`IND_LEVEL`) to dim external
+  hardware from a user-defined auxiliary output, with the same perceptual
+  curve, `base_bright` ceiling and `range_min`/`range_max` span. See
+  `control_surfaces_aux_spec.md`.
 
 ### 6.7 Poll budget
 
@@ -1401,6 +1422,23 @@ are flash-persistent) and try the decoder before the hash fallback.
 ---
 
 ## 11. Compatibility
+
+Caps v9 and later carry their compatibility notes in the companion specs.
+Groups and macros (caps v9, directory V18) are in
+`control_surfaces_groups_macros_spec.md`, the I2C display bundle (caps
+v10-v13, directory V19) in `control_surfaces_display_spec.md`, and auxiliary
+outputs (caps v17, directory V20) in `control_surfaces_aux_spec.md`. Caps
+v14-v16 appended subharmonic synthesizer nouns and widened three of their
+ranges, with no structure or stored-config change.
+
+**Caps v16 -> v17.** Two nouns are appended (68, 69), one target kind is
+added (`CS_TARGET_AUX` = 5), one status code is added
+(`CS_STATUS_INVALID_AUX` = `0x26`), and six commands are added
+(`0x02`-`0x07`). No existing structure changes size and no existing GET
+changes length, so external clients doing exact-length readback are
+unaffected until they opt into the new commands. The directory grows a
+292-byte block at V20; the V19->V20 migration is a prefix copy with the new
+block zeroed, which reads as every aux output off and unnamed.
 
 ### 11.1 v7 -> v8 (caps version 8, directory unchanged)
 

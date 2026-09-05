@@ -94,6 +94,13 @@
  * ceiling, pair link, solo).  Caps v16 widens the band-level nouns to +12 dB.
  * Noun additions and range changes only; no structure sizes change.
  *
+ * Caps v17 adds auxiliary outputs: 8 user-defined on/off + level values with
+ * no audio meaning (nouns 68-69, target kind CS_TARGET_AUX), named and given
+ * a boot value through a per-slot CsAuxCfg (commands 0x02-0x07, directory
+ * V20).  A physical pin follows one by binding an LED / PWM LED to the noun;
+ * nothing new claims GPIOs.  Live changes push NOTIFY_EVT_CS_AUX.
+ * See Documentation/Features/control_surfaces_aux_spec.md.
+ *
  * See Documentation/Features/control_surfaces_spec.md.
  */
 
@@ -209,6 +216,9 @@ typedef enum {
     CS_NOUN_SUBHARM_CEILING = 65, // continuous dB -40..0 (sub ceiling; 0 = off)
     CS_NOUN_SUBHARM_LINK   = 66, // bool (synthesize each pair from its mono sum)
     CS_NOUN_SUBHARM_SOLO   = 67, // bool (monitor the synthesized sub only)
+    // --- caps v17 additions ---
+    CS_NOUN_AUX            = 68, // bool; target = aux output 0..CS_MAX_AUX-1
+    CS_NOUN_AUX_LEVEL      = 69, // continuous percent 0..100; target = aux output
     CS_NOUN_COUNT
 } CsNoun;
 
@@ -233,6 +243,7 @@ typedef enum {
 #define CS_TARGET_OUTPUT_CH 2   // target = output channel (0..target_count-1)
 #define CS_TARGET_DSP_CH    3   // target = DSP channel (inputs then outputs)
 #define CS_TARGET_DSP_BAND  4   // target = DSP channel, index = filter band
+#define CS_TARGET_AUX       5   // target = aux output (0..CS_MAX_AUX-1); caps v17
 
 // Noun descriptor flags (CsNounDesc.dflags)
 #define CS_NDF_DEFERRED  0x01   // apply is deferred; engine steps from a target shadow
@@ -378,6 +389,39 @@ typedef enum {
 // ---------------------------------------------------------------------------
 // Wire / flash structures
 // ---------------------------------------------------------------------------
+
+// Auxiliary outputs (caps v17).  Eight device-global on/off + level values a
+// control can drive and an LED binding can follow; the firmware attaches no
+// meaning to them.  Sizes are frozen into the flash blob; growing them is a
+// config-format bump.
+#define CS_MAX_AUX  8
+
+// CsAuxCfg.boot_mode.  FIXED boots to boot_state / boot_level as stored.
+// SAVED additionally overwrites those two fields with the live values at
+// every REQ_CS_SAVE, so the output comes back the way it was last saved;
+// nothing ever writes flash on a toggle.
+#define CS_AUX_BOOT_FIXED  0
+#define CS_AUX_BOOT_SAVED  1
+
+// One aux output; 36 bytes, identical on the wire (REQ_SET/GET_CS_AUX_CFG
+// payload) and in flash.  An all-zero record is the safe default, meaning off,
+// 0 % and unnamed (labels fall back to "Aux N").
+typedef struct __attribute__((packed)) {
+    uint8_t boot_mode;     // CS_AUX_BOOT_*
+    uint8_t boot_state;    // 0/1 applied at boot
+    uint8_t boot_level;    // 0..100 applied at boot
+    uint8_t reserved;      // write 0
+    char    name[CS_NAME_LEN];
+} CsAuxCfg;                // 36 bytes
+
+// Aux table, directory-persisted (device-global, V20+).  All-zero = every
+// output off and unnamed; a fresh directory needs no seeding.
+#define CS_AUX_CONFIG_VERSION  1
+typedef struct __attribute__((packed)) {
+    uint8_t  version;      // CS_AUX_CONFIG_VERSION
+    uint8_t  reserved[3];
+    CsAuxCfg aux[CS_MAX_AUX];
+} CsAuxConfig;             // 292 bytes
 
 // One binding; 24 bytes, identical on the wire (REQ_SET/GET_CS_BINDING
 // payload) and in flash.  value/step/range encoding follows the noun's unit
@@ -577,7 +621,7 @@ typedef struct __attribute__((packed)) {
 } CsTypeDesc;
 
 typedef struct __attribute__((packed)) {
-    uint8_t  caps_version; // capability format version (16); see the file
+    uint8_t  caps_version; // capability format version (17); see the file
                            // header for what each version added
     uint8_t  max_bindings; // CS_MAX_BINDINGS
     uint8_t  type_count;   // CS_TYPE_COUNT (table follows, index = CsType)
@@ -653,6 +697,8 @@ typedef struct __attribute__((packed)) {
 #define CS_STATUS_I2C_IN_USE      0x24  // instance occupied by the I2C control
                                         // interface (target mode)
 #define CS_STATUS_INVALID_PAGE    0x25  // display cfg/page record invalid
+#define CS_STATUS_INVALID_AUX     0x26  // aux index out of range (a bad cfg field
+                                        // reports CS_STATUS_INVALID_VALUE)
 
 // ---------------------------------------------------------------------------
 // Public API (all main-loop context)
@@ -743,6 +789,21 @@ const CsGroup *control_surfaces_get_group(uint8_t idx);   // NULL if bad index
 const CsMacro *control_surfaces_get_macro(uint8_t idx);   // NULL if bad index
 void control_surfaces_get_ext_status(CsExtStatusPacket *out);
 
+// Auxiliary outputs (caps v17).  The cfg apply is a live-only preview under
+// the shared dirty flag like every other CS record.  State / level are
+// runtime values (never dirty, untouched by revert) written from any
+// dispatch context.  Returns PIN_CONFIG_SUCCESS or CS_STATUS_INVALID_*.
+uint8_t control_surfaces_apply_aux_cfg(uint8_t idx, const CsAuxCfg *c);
+const CsAuxConfig *control_surfaces_aux_config(void);      // persistence source
+const CsAuxCfg *control_surfaces_get_aux_cfg(uint8_t idx); // NULL if bad index
+uint8_t control_surfaces_aux_state(uint8_t idx);           // 0 if bad index
+uint8_t control_surfaces_aux_level(uint8_t idx);           // 0 if bad index
+bool control_surfaces_set_aux_state(uint8_t idx, uint8_t state);   // false if bad index
+bool control_surfaces_set_aux_level(uint8_t idx, uint8_t level);   // clamps to 100
+// Call immediately before REQ_CS_SAVE persists: folds the live state / level
+// into boot_state / boot_level on every CS_AUX_BOOT_SAVED slot.
+void control_surfaces_aux_prepare_save(void);
+
 // Re-apply the persisted config (bindings + IR commands + slot names) from
 // the directory cache, discarding the live preview.  Per-slot failures land
 // in slot_status exactly as at boot.  Main-loop only (releases and reclaims
@@ -804,10 +865,16 @@ extern volatile bool    cs_set_disp_page_pending;
 extern uint8_t          cs_set_disp_page_slot;
 extern CsDisplayPage    cs_set_disp_page_val;
 
+// Deferred aux cfg SET (REQ_SET_CS_AUX_CFG); same single-deep handoff shape.
+// Results land in cs_last_status with cs_last_slot = 0x70 | aux.
+extern volatile bool    cs_set_aux_cfg_pending;
+extern uint8_t          cs_set_aux_cfg_slot;
+extern CsAuxCfg         cs_set_aux_cfg_val;
+
 // Deferred save / revert (REQ_CS_SAVE / REQ_CS_REVERT).  Save persists the
 // whole live CS config (bindings + IR commands + slot names + groups +
-// macros + display) in one directory write; revert re-applies the stored
-// config.  Results land in cs_last_status (cs_last_slot = 0xFF).
+// macros + display + aux) in one directory write; revert re-applies the
+// stored config.  Results land in cs_last_status (cs_last_slot = 0xFF).
 extern volatile bool    cs_save_pending;
 extern volatile bool    cs_revert_pending;
 

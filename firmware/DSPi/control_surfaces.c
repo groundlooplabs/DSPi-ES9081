@@ -130,6 +130,11 @@ uint8_t          cs_set_macro_step_slot = 0;
 uint8_t          cs_set_macro_step_idx = 0;
 CsMacroStep      cs_set_macro_step_val;
 
+// Deferred aux cfg SET handoff (caps v17)
+volatile bool    cs_set_aux_cfg_pending = false;
+uint8_t          cs_set_aux_cfg_slot = 0;
+CsAuxCfg         cs_set_aux_cfg_val;
+
 // ---------------------------------------------------------------------------
 // Type capability table; the per-noun half lives in control_surfaces_nouns.c.
 // REQ_GET_CS_CAPS serves these verbatim, so host UIs and the firmware can
@@ -137,7 +142,7 @@ CsMacroStep      cs_set_macro_step_val;
 // ---------------------------------------------------------------------------
 
 static const CsCapsHeader s_caps = {
-    .caps_version = 16,
+    .caps_version = 17,
     .max_bindings = CS_MAX_BINDINGS,
     .type_count   = CS_TYPE_COUNT,
     .noun_count   = CS_NOUN_COUNT,
@@ -289,6 +294,13 @@ typedef struct {
 #define CS_GROUP_SESSION_TICKS  500   // idle gap that ends a gesture session
 
 static CsGroupConfig s_groups;                   // live group table
+
+// Aux outputs (caps v17).  The cfg is the persistence source; state / level
+// are runtime values written from any dispatch context.  Single-byte stores,
+// so the tick, the display and the vendor GETs read them without a lock.
+static CsAuxConfig       s_aux;
+static volatile uint8_t  s_aux_state[CS_MAX_AUX];
+static volatile uint8_t  s_aux_level[CS_MAX_AUX];
 static CsMacroConfig s_macros;                   // live macro table
 static uint8_t       s_group_status[CS_MAX_GROUPS];
 static uint8_t       s_macro_status[CS_MAX_MACROS];
@@ -1484,6 +1496,10 @@ static uint8_t cs_validate_values(const CsBinding *b, const CsNounDesc *nd) {
                 (b->value < nd->min_q || b->value > nd->max_q))
                 return CS_STATUS_INVALID_VALUE;
             if (b->step < 0) return CS_STATUS_INVALID_VALUE;
+            // AUX_LEVEL lives as whole percent; a fractional step would
+            // round back onto the live value on one side and stall there.
+            if (b->noun == CS_NOUN_AUX_LEVEL && (b->step % 256) != 0)
+                return CS_STATUS_INVALID_VALUE;
             if ((b->action == CS_ACT_ADJUST || b->action == CS_ACT_IND_LEVEL) &&
                 (b->range_min != 0 || b->range_max != 0)) {
                 if (b->range_min >= b->range_max ||
@@ -2278,6 +2294,35 @@ static void cs_load_stored_groups_macros(void) {
     cs_macro_recount_status();
 }
 
+static uint8_t cs_validate_aux_cfg(const CsAuxCfg *c) {
+    if (c->boot_mode > CS_AUX_BOOT_SAVED || c->boot_state > 1 ||
+        c->boot_level > 100 || c->reserved != 0)
+        return CS_STATUS_INVALID_VALUE;
+    return PIN_CONFIG_SUCCESS;
+}
+
+static void cs_reset_aux(void) {
+    memset(&s_aux, 0, sizeof(s_aux));
+    s_aux.version = CS_AUX_CONFIG_VERSION;
+}
+
+// apply_boot is true only at boot: state / level are runtime values, so a
+// revert reloads the cfg without disturbing a live relay or lamp.
+static void cs_load_stored_aux(bool apply_boot) {
+    preset_get_cs_aux(&s_aux);
+    if (s_aux.version > CS_AUX_CONFIG_VERSION) cs_reset_aux();   // future format stays idle
+    for (uint8_t i = 0; i < CS_MAX_AUX; i++) {
+        CsAuxCfg *c = &s_aux.aux[i];
+        c->name[CS_NAME_LEN - 1] = '\0';
+        if (cs_validate_aux_cfg(c) != PIN_CONFIG_SUCCESS) memset(c, 0, sizeof(*c));
+        if (apply_boot) {
+            s_aux_state[i] = c->boot_state;
+            s_aux_level[i] = c->boot_level;
+        }
+    }
+    s_aux.version = CS_AUX_CONFIG_VERSION;
+}
+
 static void cs_load_stored(void) {
     cs_load_stored_groups_macros();
     // Display pages load before bindings so a stored display binding's
@@ -2318,6 +2363,7 @@ void control_surfaces_init(void) {
     s_ir_slot = 0xFF;
     s_ir_hold = false;
     cs_reset_groups_macros();
+    cs_load_stored_aux(true);
     cs_load_stored();
 }
 
@@ -2335,6 +2381,7 @@ void control_surfaces_revert(void) {
     memset(s_ir_op, 0, sizeof(s_ir_op));
     memset(s_ir_cmd_status, 0, sizeof(s_ir_cmd_status));
     cs_reset_groups_macros();
+    cs_load_stored_aux(false);
     cs_load_stored();
 }
 
@@ -2529,6 +2576,54 @@ void control_surfaces_get_ext_status(CsExtStatusPacket *out) {
     out->macro_step = (s_macro_run != 0xFF) ? s_macro_step : 0;
     memcpy(out->group_status, s_group_status, sizeof(out->group_status));
     memcpy(out->macro_status, s_macro_status, sizeof(out->macro_status));
+}
+
+// ---------------------------------------------------------------------------
+// Aux outputs (caps v17)
+// ---------------------------------------------------------------------------
+
+uint8_t control_surfaces_apply_aux_cfg(uint8_t idx, const CsAuxCfg *c) {
+    if (idx >= CS_MAX_AUX || !c) return CS_STATUS_INVALID_AUX;
+    uint8_t st = cs_validate_aux_cfg(c);
+    if (st != PIN_CONFIG_SUCCESS) return st;   // stored record kept intact
+    s_aux.aux[idx] = *c;
+    s_aux.aux[idx].name[CS_NAME_LEN - 1] = '\0';
+    return PIN_CONFIG_SUCCESS;
+}
+
+const CsAuxConfig *control_surfaces_aux_config(void) { return &s_aux; }
+
+const CsAuxCfg *control_surfaces_get_aux_cfg(uint8_t idx) {
+    return (idx < CS_MAX_AUX) ? &s_aux.aux[idx] : NULL;
+}
+
+uint8_t control_surfaces_aux_state(uint8_t idx) {
+    return (idx < CS_MAX_AUX) ? s_aux_state[idx] : 0;
+}
+
+uint8_t control_surfaces_aux_level(uint8_t idx) {
+    return (idx < CS_MAX_AUX) ? s_aux_level[idx] : 0;
+}
+
+bool control_surfaces_set_aux_state(uint8_t idx, uint8_t state) {
+    if (idx >= CS_MAX_AUX) return false;
+    s_aux_state[idx] = state ? 1 : 0;
+    return true;
+}
+
+bool control_surfaces_set_aux_level(uint8_t idx, uint8_t level) {
+    if (idx >= CS_MAX_AUX) return false;
+    s_aux_level[idx] = (level > 100) ? 100 : level;
+    return true;
+}
+
+void control_surfaces_aux_prepare_save(void) {
+    for (uint8_t i = 0; i < CS_MAX_AUX; i++) {
+        CsAuxCfg *c = &s_aux.aux[i];
+        if (c->boot_mode != CS_AUX_BOOT_SAVED) continue;
+        c->boot_state = s_aux_state[i];
+        c->boot_level = s_aux_level[i];
+    }
 }
 
 void control_surfaces_get_status(CsStatusPacket *out) {

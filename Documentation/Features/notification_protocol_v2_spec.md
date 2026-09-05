@@ -68,14 +68,17 @@ Bytes 4..N are event-specific. Host MUST size its read by `actual_length`, not b
 | 0x05 | `NOTIFY_EVT_INPUT_FORMAT`     | Discrete     | Active USB/pipeline input channel count changed. Payload: `uint8_t channels` (byte 4). |
 | 0x06 | reserved (coalesceable)      |              | Reserved for batched `PARAM_CHANGED` (see §10.5). |
 | 0x07 | `NOTIFY_EVT_SIGGEN_STATE`     | Discrete     | Test-signal generator start/stop/completion. See §3.8. |
-| 0x08..0x7F | reserved (coalesceable) |              | |
+| 0x0C | `NOTIFY_EVT_CS_AUX`           | Discrete     | Aux output state or level changed. 8-byte packet `[ver=2, 0x0C, flags=0, seq, aux (0-7), state (0/1), level (0-100), src]`. Pushed on every `REQ_SET_CS_AUX_STATE` (0x04) and `REQ_SET_CS_AUX_LEVEL` (0x06), whatever the origin. `src` identifies it: `GPIO` for a bound control, `HOST_SET` for USB, `UART` / `I2C` for those transports. |
+| 0x0D..0x7F | reserved (coalesceable) |              | |
 | 0x80..0xFF | reserved (discrete)     |              | |
 
 > **Note on discrete IDs below 0x80.** The original design reserved `0x80..0xFF`
 > for discrete events, but the discrete `INPUT_FORMAT` (0x05) and `SIGGEN_STATE`
 > (0x07) events were assigned low IDs in practice. Hosts must classify by event ID,
 > not by range. `NOTIFY_EVT_ERROR` (formerly penciled in at 0x05) was never wired
-> up.
+> up. The same applies to 0x08..0x0B (`ADAT_STATE`, `I2S_SLAVE_STATE`,
+> `CS_IR_LEARN`, `ADAT_INPUT_STATE`) and `CS_AUX` (0x0C), all discrete and all
+> declared in `notify.h`.
 
 ### 3.4 PARAM_CHANGED Layout
 

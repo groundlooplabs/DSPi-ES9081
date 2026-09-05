@@ -427,6 +427,21 @@ void notify_push_cs_ir_learn(uint8_t state, uint8_t protocol, uint32_t code) {
     restore_interrupts(flags);
 }
 
+// Source is the caller's, not INTERNAL: an aux can be driven by a bound
+// control as well as by a host or transport, and the host filters on it.
+void notify_push_cs_aux(uint8_t aux, uint8_t state, uint8_t level, ParamSource src) {
+    uint32_t flags = save_and_disable_interrupts();
+    NotifyRingEntry e = {
+        .event_id = NOTIFY_EVT_CS_AUX,
+        .source   = (uint8_t)src,
+    };
+    e.value[0] = aux;
+    e.value[1] = state;
+    e.value[2] = level;
+    ring_push_locked(&e);
+    restore_interrupts(flags);
+}
+
 void notify_push_bulk_invalidated(ParamSource src) {
     uint32_t flags = save_and_disable_interrupts();
 
@@ -645,6 +660,20 @@ uint16_t notify_peek_next_for(NotifyConsumer c, uint8_t *out_buf, uint16_t max_l
             out_buf[10] = e.value[4];
             out_buf[11] = e.value[5];
             return 12;
+        }
+
+        case NOTIFY_EVT_CS_AUX: {
+            // 8 bytes: aux index, state, level, source.
+            if (max_len < 8) return 0;
+            out_buf[0] = NOTIFY_V2_VERSION;
+            out_buf[1] = NOTIFY_EVT_CS_AUX;
+            out_buf[2] = 0;
+            out_buf[3] = seq;
+            out_buf[4] = e.value[0];
+            out_buf[5] = e.value[1];
+            out_buf[6] = e.value[2];
+            out_buf[7] = e.source;
+            return 8;
         }
 
         default:

@@ -30,7 +30,9 @@ RAM_LEN = {"rp2040": 262144, "rp2350": 524288}
 # rp2350 raised 64K -> 72K for the ADAT input receiver (2026-07-13): the
 # RAM-pinned decode path (adat_input_poll + rate machine + shared servo)
 # adds ~3 KB of deliberately hot code.
-DATA_BUDGET = {"rp2040": 61440, "rp2350": 73728}
+# Raised 2026-09-07 with the spectrum analyser: RP2040 sat 368 B under the
+# old 60K and the RP2350 image had already outgrown 72K before this change.
+DATA_BUDGET = {"rp2040": 65536, "rp2350": 92160}
 
 # Flash callees that are cold-path-only and safe for a hot caller to reference.
 WHITELIST = {
@@ -114,6 +116,10 @@ COMMON = [
     # Signal generator: siggen_render runs in the block pipeline; the synth
     # helpers below are file-static and may be inlined (static_ok).
     ("siggen_render", False),
+    # Spectrum analyser: the taps run inside the meter loops on both cores;
+    ("rta_packet_begin", False),
+    ("rta_packet_end", False),
+    ("rta_tap", False),
     ("osc_sin", True),
     ("blep", True),
     ("synth_sine", True),

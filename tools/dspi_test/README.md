@@ -77,7 +77,8 @@ Exit code is `0` only if there are no `FAIL`/`ERROR` results.
 ## Groups
 
 `identity` · `eq` · `dynamics` · `outputs` · `volume` · `inputs` · `diagnostics`
-· `presets` · `crosscut` · `stress` · `audio` (opt-in, `--audio`)
+· `presets` · `crosscut` · `stress` · `rta` (spectrum analyser; needs the
+siggen, one test also needs `--audio`) · `audio` (opt-in, `--audio`)
 
 ## Audio loopback (optional)
 

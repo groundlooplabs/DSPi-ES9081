@@ -141,6 +141,16 @@ extern volatile uint32_t nominal_feedback_10_14;
 #define REQ_SET_CS_AUX_LEVEL        0x06  // wValue = aux (0-7), 1 byte 0..100 (clamped)
 #define REQ_GET_CS_AUX_LEVEL        0x07  // wValue = aux (0-7); returns 1 byte
 
+// Spectrum analyser (RTA / FFT).  Documentation/Features/spectrum_analyser_spec.md
+#define REQ_RTA_SET_CONFIG          0x08  // 12-byte RtaConfig; STALL on invalid
+#define REQ_RTA_GET_CONFIG          0x09  // returns RtaConfig (12 B)
+#define REQ_RTA_GET_CAPS            0x0A  // wValue 0 = RtaCaps (16 B); 1.. = band centre chunks
+#define REQ_RTA_GET_BANDS           0x0B  // wValue = channel; returns RtaBandFrame (80 B)
+#define REQ_RTA_GET_BINS            0x0C  // wValue = byte offset into the bin frame
+#define REQ_RTA_GET_STATUS          0x0D  // returns RtaStatus (24 B)
+#define REQ_RTA_CONTROL             0x0E  // wValue = RTA_CTL_*; returns 1 byte
+#define REQ_RTA_GET_BANDS_ALL       0x0F  // USB only: every live channel's RtaBandFrame
+
 // Control Surfaces target groups and macros (caps v9); see control_surfaces.h
 // and Documentation/Features/control_surfaces_groups_macros_spec.md.  0x10-0x1F
 // and 0x2C-0x2F hold the subharmonic synthesizer (below).

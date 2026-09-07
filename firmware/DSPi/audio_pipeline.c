@@ -22,6 +22,7 @@
 #include "flash_storage.h"
 #include "pdm_generator.h"
 #include "siggen.h"
+#include "rta.h"
 #include "upmix.h"
 #include "adat_output.h"
 #include "output_s24.h"
@@ -267,6 +268,9 @@ uint8_t __not_in_flash_func(active_input_channel_count)(void) {
 
 void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
     uint32_t packet_start = time_us_32();
+    // Must precede the Core 1 dispatch below: eq_worker_loop reads rta_view
+    // after work_ready, and rta_packet_end() reads it back after work_done.
+    rta_packet_begin(sample_count);
 
     // Get audio buffers for S/PDIF outputs
 #if PICO_RP2350
@@ -409,6 +413,7 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         }
         global_status.peaks[k] = (uint16_t)(fminf(1.0f, pk) * 32767.0f);
         if (pk > CLIP_THRESH_F) global_status.clip_flags |= (1u << k);
+        rta_tap(RTA_TAP_INPUT, (uint8_t)k, ibuf, sample_count);
     }
     for (int k = n_active_inputs; k < NUM_INPUT_CHANNELS; k++)
         global_status.peaks[k] = 0;
@@ -457,6 +462,7 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
             }
             global_status.peaks[row] = (uint16_t)(fminf(1.0f, pk) * 32767.0f);
             if (pk > CLIP_THRESH_F) global_status.clip_flags |= (1u << row);
+            rta_tap(RTA_TAP_INPUT, (uint8_t)row, dbuf, sample_count);
         }
     } else {
         upmix_park();
@@ -662,6 +668,7 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
             }
             global_status.peaks[CH_OUT_1 + out] = (uint16_t)(fminf(1.0f, peak) * 32767.0f);
             if (peak > CLIP_THRESH_F) global_status.clip_flags |= (1u << (CH_OUT_1 + out));
+            rta_tap(RTA_TAP_OUTPUT, (uint8_t)out, buf_out[out], sample_count);
         }
         // PDM is inactive in EQ_WORKER mode
         global_status.peaks[CH_OUT_SUB] = 0;
@@ -794,6 +801,7 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
             }
             global_status.peaks[CH_OUT_1 + out] = (uint16_t)(fminf(1.0f, peak) * 32767.0f);
             if (peak > CLIP_THRESH_F) global_status.clip_flags |= (1u << (CH_OUT_1 + out));
+            rta_tap(RTA_TAP_OUTPUT, (uint8_t)out, buf_out[out], sample_count);
         }
 
         // Finalize outputs 0-7 (see output_s24.h).  ADAT active: convert to
@@ -828,6 +836,7 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
             }
             global_status.peaks[CH_OUT_SUB] = (uint16_t)(fminf(1.0f, peak_sub) * 32767.0f);
             if (peak_sub > CLIP_THRESH_F) global_status.clip_flags |= (1u << CH_OUT_SUB);
+            rta_tap(RTA_TAP_OUTPUT, NUM_OUTPUT_CHANNELS - 1, buf_out[NUM_OUTPUT_CHANNELS-1], sample_count);
             for (uint32_t i = 0; i < sample_count; i++) {
                 int32_t pdm_sample_q28 = (int32_t)(buf_out[NUM_OUTPUT_CHANNELS-1][i] * pdm_scale);
                 pdm_push_sample(pdm_sample_q28, false);
@@ -912,6 +921,7 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         }
         global_status.peaks[k] = (uint16_t)(pk >> 13);
         if (pk > CLIP_THRESH_Q28) global_status.clip_flags |= (1u << k);
+        rta_tap(RTA_TAP_INPUT, (uint8_t)k, ibuf, sample_count);
     }
 
     // ========== PASS 2.5: Volume Leveller ========== (masks select L/R)
@@ -1087,6 +1097,7 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
             }
             global_status.peaks[CH_OUT_1 + out] = (uint16_t)(peak >> 13);
             if (peak > CLIP_THRESH_Q28) global_status.clip_flags |= (1u << (CH_OUT_1 + out));
+            rta_tap(RTA_TAP_OUTPUT, (uint8_t)out, buf_out[out], sample_count);
         }
         // PDM is inactive in EQ_WORKER mode
         global_status.peaks[CH_OUT_SUB] = 0;
@@ -1211,6 +1222,7 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
             }
             global_status.peaks[CH_OUT_1 + out] = (uint16_t)(peak >> 13);
             if (peak > CLIP_THRESH_Q28) global_status.clip_flags |= (1u << (CH_OUT_1 + out));
+            rta_tap(RTA_TAP_OUTPUT, (uint8_t)out, buf_out[out], sample_count);
         }
 
         // S/PDIF conversion (2 stereo pairs)
@@ -1239,6 +1251,7 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
             }
             global_status.peaks[CH_OUT_SUB] = (uint16_t)(peak_sub >> 13);
             if (peak_sub > CLIP_THRESH_Q28) global_status.clip_flags |= (1u << CH_OUT_SUB);
+            rta_tap(RTA_TAP_OUTPUT, (uint8_t)pdm_out, buf_out[pdm_out], sample_count);
             for (uint32_t i = 0; i < sample_count; i++) {
                 pdm_push_sample(buf_out[pdm_out][i], false);
             }
@@ -1285,6 +1298,7 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
     if (audio_buf[1]) give_audio_buffer(producer_pool_2, audio_buf[1]);
 #endif
 
+    rta_packet_end(sample_count);
     uint32_t packet_end = time_us_32();
 
     // Budget-based CPU metering: compare processing time against the time

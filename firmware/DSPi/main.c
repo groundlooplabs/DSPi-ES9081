@@ -33,6 +33,7 @@
 #include "adat_input.h"
 #include "pdm_generator.h"
 #include "siggen.h"
+#include "rta.h"
 #include "upmix.h"
 #include "usb_audio.h"
 #include "notify.h"
@@ -186,6 +187,7 @@ static void perform_rate_change(uint32_t new_freq, bool defer_output_to_input_pr
     // other sources everything downstream (loudness/crossfeed/leveller
     // recompute handlers, REQ_GET_STATUS) reads audio_state.freq.
     audio_state.freq = new_freq;
+    rta_restart();
 
 #if PICO_RP2350
     // RP2350: 307.2MHz fixed (VCO 1536 / 5 / 1) — no clock switching
@@ -1965,6 +1967,7 @@ void core0_init() {
     // notify_init so its dispatched writes notify normally.  Pot/switch
     // boot-sync dispatches fire from the first main-loop ticks, not here.
     control_surfaces_init();
+    rta_init();
 }
 
 int main(void) {
@@ -2025,6 +2028,10 @@ int main(void) {
         // generator is idle.
         siggen_service();
         siggen_pump();
+
+        // Spectrum analyser: apply staged config, one bounded transform
+        // step, auto-off.  Immediate no-op while idle.
+        rta_service();
 
         // Drain USB audio ring — highest priority (only when USB is active input).
         // USB ISR pushes raw packets into the ring; we run the full DSP
@@ -2839,6 +2846,7 @@ int main(void) {
                 // Generator state is strictly transient: a preset load always
                 // silences it (audio is already muted here, so no fade).
                 siggen_stop_immediate(SIGGEN_STOP_PRESET);
+                rta_restart();
 
                 extern uint8_t output_types[];
 
@@ -3088,6 +3096,7 @@ int main(void) {
 
                 // Transient generator state: factory reset silences it.
                 siggen_stop_immediate(SIGGEN_STOP_PRESET);
+                rta_restart();
 
                 extern uint8_t output_types[];
 
@@ -3709,6 +3718,7 @@ int main(void) {
                 }
 
                 active_input_source = new_source;
+                rta_restart();
 
                 // Drop any pending rate change armed for the OLD source (e.g.
                 // a USB SET_CUR that landed after this iteration's rate-change

@@ -1,0 +1,576 @@
+/*
+ * rta.c -- Onboard spectrum analyser engine.
+ *
+ * One capture buffer rotates over the selected channels.  It fills from the
+ * audio path, is transformed in place from the main loop in bounded steps,
+ * and publishes into per-channel band state and the shared bin frame.  All
+ * state transitions happen on Core 0; Core 1 only ever copies samples
+ * through the per-packet view.
+ *
+ * Design and protocol: Documentation/Features/spectrum_analyser_spec.md.
+ */
+
+#include "rta.h"
+#include "audio_pipeline.h"
+#include "usb_audio.h"
+#if PICO_RP2350
+#include "upmix.h"
+#endif
+#include "pico/time.h"
+#include "hardware/sync.h"
+#include <string.h>
+
+// ---------------------------------------------------------------------------
+// Shared with the tap (see rta.h)
+// ---------------------------------------------------------------------------
+
+RtaPacketView rta_view;
+rta_sample_t  rta_buf[RTA_MAX_POINTS];
+
+// ---------------------------------------------------------------------------
+// Engine state (Core 0 only)
+// ---------------------------------------------------------------------------
+
+enum { PH_FILL = 0, PH_FFT = 1, PH_FINISH = 2 };
+
+typedef struct {
+    float    ema[RTA_MAX_BANDS];   // averaged band power, linear
+    uint8_t  avg[RTA_MAX_BANDS];
+    uint8_t  peak[RTA_MAX_BANDS];
+    uint8_t  seq;
+    bool     seen;
+    uint32_t t_us;
+    // Peak-decay time carried between publishes so short intervals still
+    // decay (20 dB/s over one 21 ms frame is under one 0.5 dB step).
+    uint32_t peak_acc_us;
+} RtaChannel;
+
+static struct {
+    RtaConfig cfg;
+    RtaConfig cfg_next;
+    bool      cfg_pending;
+    uint8_t   state;               // RTA_STATE_*
+    uint8_t   phase;               // PH_*
+    uint8_t   ch;                  // channel being captured / transformed
+    uint8_t   order;
+    uint8_t   stage;               // rta_fft_step cursor
+    uint16_t  n;                   // 1 << order
+    uint16_t  wr;                  // capture write index
+    uint32_t  frame_busy_us;       // transform time of the frame in flight
+    const RtaBandTable *table;
+    uint32_t  rate_hz;
+    uint16_t  live_mask;
+    uint32_t  last_read_us;
+    bool      ever_read;
+    RtaChannel ch_state[RTA_MAX_TRACKED];
+    // Bin frame: header | bins[n/2] | seq tail.
+    uint8_t   bin_frame[RTA_BIN_FRAME_MAX];
+    uint16_t  bin_len;             // fixed per config
+    uint8_t   bin_seq;
+    // Statistics, one-second windows.
+    uint32_t  stat_window_us;
+    uint32_t  busy_acc_us;
+    uint16_t  frames_acc;
+    uint16_t  busy_us_per_s;
+    uint16_t  frames_per_s;
+    uint16_t  last_frame_us;
+} rta;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+static inline uint8_t tap_width(uint8_t tap) {
+    return (tap == RTA_TAP_INPUT) ? NUM_INPUT_CHANNELS : NUM_OUTPUT_CHANNELS;
+}
+
+static inline uint16_t tap_valid_mask(uint8_t tap) {
+    return (uint16_t)((1u << tap_width(tap)) - 1u);
+}
+
+// Selected AND live right now.  Input side follows the active USB alt and
+// the upmixer's derived rows; output side follows the matrix enables.
+static uint16_t compute_live_mask(void) {
+    uint16_t live = 0;
+    if (rta.cfg.tap == RTA_TAP_INPUT) {
+        uint8_t n = active_input_channel_count();
+        if (n > NUM_INPUT_CHANNELS) n = NUM_INPUT_CHANNELS;
+        live = (uint16_t)((1u << n) - 1u);
+#if PICO_RP2350
+        const UpmixCoeffs *um = (const UpmixCoeffs *)current_upmix_coeffs;
+        if (um && n == NUM_STEREO_INPUTS) {
+            live |= (uint16_t)(((1u << um->n_derived) - 1u) << NUM_STEREO_INPUTS);
+        }
+#endif
+    } else {
+        for (int o = 0; o < NUM_OUTPUT_CHANNELS; o++) {
+            if (matrix_mixer.outputs[o].enabled) live |= (uint16_t)(1u << o);
+        }
+    }
+    return live & rta.cfg.channel_mask & tap_valid_mask(rta.cfg.tap);
+}
+
+// Next set bit above cur, wrapping.  RTA_CH_NONE when mask is empty.
+static uint8_t next_live(uint8_t cur, uint16_t mask) {
+    if (!mask) return RTA_CH_NONE;
+    for (int i = 1; i <= 16; i++) {
+        uint8_t c = (uint8_t)((cur + i) & 15);
+        if (mask & (1u << c)) return c;
+    }
+    return RTA_CH_NONE;
+}
+
+// Lowest band the table resolves (empty bands are lo > hi).  0xFF = none.
+static uint8_t table_first_band(const RtaBandTable *t) {
+    if (!t) return 0xFF;
+    for (uint8_t b = 0; b < t->n_bands; b++) {
+        if (t->lo[b] <= t->hi[b]) return b;
+    }
+    return 0xFF;
+}
+
+// Sequence numbers skip 0xFF, which marks a tail as invalid mid-write.
+static uint8_t next_seq(uint8_t s) {
+    s++;
+    return (s == 0xFF) ? 0 : s;
+}
+
+static void clear_channel_state(void) {
+    memset(rta.ch_state, 0, sizeof(rta.ch_state));
+}
+
+static void start_fill(uint8_t ch) {
+    rta.ch = ch;
+    rta.wr = 0;
+    rta.stage = 0;
+    rta.frame_busy_us = 0;
+    __dmb();
+    rta.phase = PH_FILL;
+}
+
+// Everything the applied config and the current rate determine, so status
+// and reads describe the applied config even while the engine is idle.
+static void derive_layout(void) {
+    rta.rate_hz = (uint32_t)audio_state.freq;
+    rta.order = rta.cfg.fft_order;
+    rta.n = (uint16_t)(1u << rta.order);
+    rta.table = rta_band_table(rta.rate_hz, rta.order);
+    // Layout is fixed for the life of a config so the seq tail never moves
+    // while a host is reading chunks.
+    rta.bin_len = (uint16_t)(sizeof(RtaBinFrameHeader) + rta.n / 2 + 1);
+    memset(rta.bin_frame, 0, sizeof(rta.bin_frame));
+    rta.bin_frame[rta.bin_len - 1] = 0xFF;
+}
+
+// Begin a fresh capture from the lowest live channel.
+static void arm(void) {
+    derive_layout();
+    rta.live_mask = compute_live_mask();
+    uint8_t first = next_live(15, rta.live_mask);
+    start_fill(first);
+    rta.state = (first != RTA_CH_NONE && rta.table) ? RTA_STATE_CAPTURING : RTA_STATE_IDLE;
+    // A start counts as a read, or auto-off would undo it on the next pass.
+    rta.last_read_us = time_us_32();
+    rta.ever_read = true;
+}
+
+static void stop_engine(void) {
+    rta.state = RTA_STATE_IDLE;
+    rta.live_mask = 0;
+    rta_view.tap = RTA_TAP_NONE;
+    rta_view.take = 0;
+    __dmb();
+}
+
+// ---------------------------------------------------------------------------
+// Publish
+// ---------------------------------------------------------------------------
+
+// Whole 0.5 dB steps of peak decay earned since the last publish, carrying
+// the unspent time in *acc.
+static uint32_t peak_drop_steps(uint32_t *acc, uint32_t dt_us) {
+    uint32_t rate = (uint32_t)rta.cfg.peak_decay_db_s * 2u;   // steps per second
+    if (rate == 0) { *acc = 0; return 0; }
+    uint32_t total = *acc + dt_us;
+    uint32_t steps = (uint32_t)(((uint64_t)rate * total) / 1000000u);
+    *acc = total - (uint32_t)(((uint64_t)steps * 1000000u) / rate);
+    return steps;
+}
+
+// Fold one band power into the channel's average and peak.  dt drives the
+// EMA coefficient so the time constant stays in real time however many
+// channels share the rotation.
+static void update_band(RtaChannel *c, uint8_t b, float power, uint32_t dt_us,
+                        uint32_t drop, bool first) {
+    float tau_us = (float)rta.cfg.avg_ms * 1000.0f;
+    if (first || tau_us <= 0.0f) {
+        c->ema[b] = power;
+    } else {
+        float a = (float)dt_us / (tau_us + (float)dt_us);
+        c->ema[b] += a * (power - c->ema[b]);
+    }
+    c->avg[b] = rta_level_from_power(c->ema[b]);
+
+    uint8_t inst = rta_level_from_power(power);
+    if (rta.cfg.peak_decay_db_s == 0 || first) {
+        c->peak[b] = inst;
+    } else {
+        uint8_t decayed = (drop >= c->peak[b]) ? 0 : (uint8_t)(c->peak[b] - drop);
+        c->peak[b] = (inst > decayed) ? inst : decayed;
+    }
+}
+
+static void publish(const float *power) {
+    RtaChannel *c = &rta.ch_state[rta.ch];
+    const RtaBandTable *t = rta.table;
+    uint32_t now = time_us_32();
+    bool first = !c->seen;
+    uint32_t dt = first ? 0 : (now - c->t_us);
+    uint32_t drop = peak_drop_steps(&c->peak_acc_us, dt);
+    for (uint8_t b = 0; b < t->n_bands; b++) update_band(c, b, power[b], dt, drop, first);
+    c->t_us = now;
+    c->seen = true;
+    c->seq++;
+
+    // Bin frame header: bins were written in place by rta_fft_finish before
+    // this call; the tail was cleared first so a reader spanning the write
+    // sees a mismatch and re-reads.
+    RtaBinFrameHeader *h = (RtaBinFrameHeader *)rta.bin_frame;
+    h->version = RTA_CFG_VERSION;
+    h->channel = rta.ch;
+    h->fft_order = rta.order;
+    h->sample_rate_hz = rta.rate_hz;
+    h->n_bins = (uint16_t)(rta.n / 2);
+    h->reserved[0] = h->reserved[1] = h->reserved[2] = 0;
+    rta.bin_seq = next_seq(rta.bin_seq);
+    h->seq = rta.bin_seq;
+    rta.bin_frame[rta.bin_len - 1] = rta.bin_seq;
+
+    rta.frames_acc++;
+    rta.last_frame_us = (uint16_t)(rta.frame_busy_us > 0xFFFF ? 0xFFFF : rta.frame_busy_us);
+}
+
+// ---------------------------------------------------------------------------
+// Transform steps (main loop)
+// ---------------------------------------------------------------------------
+
+// Move to the next live channel, or stop if none.
+static void advance(void) {
+    rta.live_mask = compute_live_mask();
+    uint8_t nx = next_live(rta.ch, rta.live_mask);
+    if (nx == RTA_CH_NONE) {
+        stop_engine();
+        return;
+    }
+    start_fill(nx);
+}
+
+// One bounded unit of work.  Returns true if it did anything.
+static bool step(void) {
+    if (rta.phase == PH_FILL) return false;
+    uint32_t t0 = time_us_32();
+    if (rta.phase == PH_FFT) {
+        if (rta_fft_step(rta_buf, rta.order, &rta.stage)) rta.phase = PH_FINISH;
+        uint32_t dt = time_us_32() - t0;
+        rta.frame_busy_us += dt;
+        rta.busy_acc_us += dt;
+        return true;
+    }
+
+    float power[RTA_MAX_BANDS];
+    // Invalidate the tail before touching any bins (spec section 5.1).
+    rta.bin_frame[rta.bin_len - 1] = 0xFF;
+    rta_fft_finish(rta_buf, rta.order, rta.table, power,
+                   rta.bin_frame + sizeof(RtaBinFrameHeader));
+    // Charge the finish to the frame before publish reads it.
+    uint32_t dt = time_us_32() - t0;
+    rta.frame_busy_us += dt;
+    rta.busy_acc_us += dt;
+
+    publish(power);
+    advance();
+    return true;
+}
+
+static void tick_stats(uint32_t now) {
+    if ((uint32_t)(now - rta.stat_window_us) < 1000000u) return;
+    rta.stat_window_us = now;
+    uint32_t b = rta.busy_acc_us > 0xFFFF ? 0xFFFF : rta.busy_acc_us;
+    uint32_t x = rta.busy_us_per_s;
+    rta.busy_us_per_s = (uint16_t)(x - ((x + 3u) >> 2) + (b >> 2));
+    rta.frames_per_s = rta.frames_acc;
+    rta.busy_acc_us = 0;
+    rta.frames_acc = 0;
+}
+
+// A channel that stops being tapped mid-fill (output disabled, USB alt
+// change, upmixer parked) would never fill; move on instead of stalling.
+static void check_fill_liveness(void) {
+    if (rta.phase != PH_FILL) return;
+    uint16_t live = compute_live_mask();
+    if (!(live & (1u << rta.ch))) advance();
+}
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+static bool config_valid(const RtaConfig *c) {
+    if (c->version != RTA_CFG_VERSION) return false;
+    if (c->tap != RTA_TAP_INPUT && c->tap != RTA_TAP_OUTPUT) return false;
+    if (c->fft_order < RTA_ORDER_MIN || c->fft_order > RTA_ORDER_MAX) return false;
+    if ((c->channel_mask & tap_valid_mask(c->tap)) == 0) return false;
+    return true;
+}
+
+static void apply_config(void) {
+    RtaConfig n = rta.cfg_next;
+    if (n.avg_ms > 10000) n.avg_ms = 10000;
+    if (n.peak_decay_db_s > 100) n.peak_decay_db_s = 100;
+    n.channel_mask &= tap_valid_mask(n.tap);
+    n.reserved0 = 0;
+    n.reserved = 0;
+    bool restart = n.tap != rta.cfg.tap || n.channel_mask != rta.cfg.channel_mask ||
+                   n.fft_order != rta.cfg.fft_order;
+    rta.cfg = n;
+    if (restart) {
+        bool was_running = (rta.state != RTA_STATE_IDLE);
+        stop_engine();
+        clear_channel_state();
+        if (was_running) arm(); else derive_layout();
+    }
+}
+
+bool rta_set_config(const void *payload, uint16_t len) {
+    if (len != sizeof(RtaConfig)) return false;
+    RtaConfig c;
+    memcpy(&c, payload, sizeof(c));
+    if (!config_valid(&c)) return false;
+    rta.cfg_next = c;
+    rta.cfg_pending = true;
+    return true;
+}
+
+void rta_get_config(RtaConfig *out) { *out = rta.cfg; }
+
+void rta_get_caps(RtaCaps *out) {
+    memset(out, 0, sizeof(*out));
+    out->version = RTA_CFG_VERSION;
+    out->input_channels = NUM_INPUT_CHANNELS;
+    out->output_channels = NUM_OUTPUT_CHANNELS;
+    out->fft_order_min = RTA_ORDER_MIN;
+    out->fft_order_max = RTA_ORDER_MAX;
+#if PICO_RP2350
+    out->fft_order_default = 10;
+    out->dynamic_range_db = 120;
+#else
+    out->fft_order_default = 9;
+    out->dynamic_range_db = 78;   // measured Q15 floor -78.5 dBFS (tools/rta_test)
+#endif
+    out->max_bands = RTA_MAX_BANDS;
+    out->level_zero = RTA_LEVEL_ZERO_DBFS;
+    out->idle_timeout_ms = RTA_IDLE_TIMEOUT_MS;
+    out->max_bin_frame = RTA_BIN_FRAME_MAX;
+}
+
+uint16_t rta_get_caps_centres(uint8_t chunk, uint8_t *out) {
+    if (chunk == 0) return 0;
+    uint8_t first = (uint8_t)((chunk - 1) * 32);
+    if (first >= RTA_MAX_BANDS) return 0;
+    uint8_t n = (uint8_t)(RTA_MAX_BANDS - first);
+    if (n > 32) n = 32;
+    for (uint8_t i = 0; i < n; i++) {
+        uint16_t hz = rta_band_centre_hz((uint8_t)(first + i));
+        out[2 * i] = (uint8_t)(hz & 0xFF);
+        out[2 * i + 1] = (uint8_t)(hz >> 8);
+    }
+    return (uint16_t)(n * 2);
+}
+
+// ---------------------------------------------------------------------------
+// Reads
+// ---------------------------------------------------------------------------
+
+static uint16_t age_ms(uint32_t now, uint32_t then, bool valid) {
+    if (!valid) return 0xFFFF;
+    uint32_t ms = (now - then) / 1000u;
+    return (ms > 0xFFFE) ? 0xFFFE : (uint16_t)ms;
+}
+
+bool rta_get_band_frame(uint8_t channel, RtaBandFrame *out) {
+    if (channel >= tap_width(rta.cfg.tap)) return false;
+    const RtaChannel *c = &rta.ch_state[channel];
+    uint32_t now = time_us_32();
+    memset(out, 0, sizeof(*out));
+    out->version = RTA_CFG_VERSION;
+    out->channel = channel;
+    out->seq = c->seq;
+    out->n_bands = rta.table ? rta.table->n_bands : 0;
+    out->age_ms = age_ms(now, c->t_us, c->seen);
+    memcpy(out->avg, c->avg, RTA_MAX_BANDS);
+    memcpy(out->peak, c->peak, RTA_MAX_BANDS);
+    return true;
+}
+
+const uint8_t *rta_bin_frame(uint16_t *len) {
+    *len = rta.bin_len;
+    return rta.bin_frame;
+}
+
+void rta_get_status(RtaStatus *out) {
+    uint32_t now = time_us_32();
+    memset(out, 0, sizeof(*out));
+    out->version = RTA_CFG_VERSION;
+    out->state = rta.state;
+    if (rta.state != RTA_STATE_IDLE && rta.phase != PH_FILL) {
+        out->state = RTA_STATE_TRANSFORMING;
+    }
+    out->tap = rta.cfg.tap;
+    out->channel = (rta.state == RTA_STATE_IDLE) ? RTA_CH_NONE : rta.ch;
+    out->live_mask = rta.live_mask;
+    out->live_count = (uint8_t)__builtin_popcount(rta.live_mask);
+    out->frames_per_s = rta.frames_per_s;
+    out->busy_us_per_s = rta.busy_us_per_s;
+    out->last_frame_us = rta.last_frame_us;
+    out->idle_ms = age_ms(now, rta.last_read_us, rta.ever_read);
+    out->sample_rate_hz = rta.rate_hz;
+    out->first_band = table_first_band(rta.table);
+}
+
+bool rta_control(uint8_t action) {
+    switch (action) {
+    case RTA_CTL_STOP:
+        stop_engine();
+        return true;
+    case RTA_CTL_START:
+        if (rta.state == RTA_STATE_IDLE) { clear_channel_state(); arm(); }
+        return true;
+    case RTA_CTL_RESET_AVG:
+        // Clear the published values too, so a read before the next publish
+        // shows an empty frame rather than the pre-reset picture.
+        for (int i = 0; i < RTA_MAX_TRACKED; i++) {
+            rta.ch_state[i].seen = false;
+            memset(rta.ch_state[i].avg, 0, RTA_MAX_BANDS);
+            memset(rta.ch_state[i].peak, 0, RTA_MAX_BANDS);
+        }
+        return true;
+    default:
+        return false;
+    }
+}
+
+void rta_note_read(void) {
+    rta.last_read_us = time_us_32();
+    rta.ever_read = true;
+    if (rta.state == RTA_STATE_IDLE && !(rta.cfg.flags & RTA_FLAG_MANUAL)) {
+        clear_channel_state();
+        arm();
+    }
+}
+
+uint16_t rta_live_mask(void) { return rta.live_mask; }
+
+// ---------------------------------------------------------------------------
+// Pipeline integration (Core 0)
+// ---------------------------------------------------------------------------
+
+void __not_in_flash_func(rta_packet_begin)(uint32_t sample_count) {
+    RtaPacketView *v = &rta_view;
+    v->tap = RTA_TAP_NONE;
+    v->take = 0;
+    v->produced = 0;
+    if (rta.state == RTA_STATE_CAPTURING && rta.phase == PH_FILL) {
+        uint32_t room = rta.n - rta.wr;
+        v->take = (uint16_t)(sample_count < room ? sample_count : room);
+        v->wr = rta.wr;
+        v->row = rta.ch;
+        v->tap = rta.cfg.tap;
+    }
+    __dmb();
+}
+
+void __not_in_flash_func(rta_packet_end)(uint32_t sample_count) {
+    (void)sample_count;
+    __dmb();
+    RtaPacketView *v = &rta_view;
+    // Advance by what the tap actually copied, never by what was offered: a
+    // row that was not tapped this packet leaves the count at 0.
+    if (v->tap != RTA_TAP_NONE && v->produced) {
+        rta.wr = (uint16_t)(rta.wr + v->produced);
+        if (rta.wr >= rta.n) { rta.stage = 0; rta.phase = PH_FFT; }
+    }
+    v->take = 0;
+    v->tap = RTA_TAP_NONE;
+}
+
+void DSP_TIME_CRITICAL rta_tap(uint8_t tap, uint8_t row, const rta_pipe_t *buf, uint32_t n) {
+    (void)n;
+    RtaPacketView *v = &rta_view;
+    if (v->tap != tap || v->row != row || !v->take) return;
+    uint32_t take = v->take;
+    rta_sample_t *dst = &rta_buf[v->wr];
+#if PICO_RP2350
+    for (uint32_t i = 0; i < take; i++) dst[i] = buf[i];
+#else
+    for (uint32_t i = 0; i < take; i++) {
+        int32_t s = buf[i] >> 13;               // Q28 -> Q15
+        if (s > 32767) s = 32767; else if (s < -32768) s = -32768;
+        dst[i] = (int16_t)s;
+    }
+#endif
+    v->produced = (uint16_t)take;
+}
+
+// ---------------------------------------------------------------------------
+// Main loop
+// ---------------------------------------------------------------------------
+
+void rta_service(void) {
+    if (rta.cfg_pending) {
+        rta.cfg_pending = false;
+        apply_config();
+    }
+    uint32_t now = time_us_32();
+    tick_stats(now);
+    if (rta.state == RTA_STATE_IDLE) return;
+
+    // MANUAL hands the run state to CONTROL entirely: no auto-start, no
+    // auto-off.
+    if (!(rta.cfg.flags & RTA_FLAG_MANUAL) &&
+        (uint32_t)(now - rta.last_read_us) > (uint32_t)RTA_IDLE_TIMEOUT_MS * 1000u) {
+        stop_engine();
+        return;
+    }
+    // A rate change without a restart call still gets caught here.
+    if ((uint32_t)audio_state.freq != rta.rate_hz) {
+        rta_restart();
+        return;
+    }
+    check_fill_liveness();
+    if (rta.state == RTA_STATE_IDLE) return;
+    step();
+}
+
+void rta_restart(void) {
+    if (rta.state == RTA_STATE_IDLE) return;
+    stop_engine();
+    clear_channel_state();
+    arm();
+}
+
+void rta_init(void) {
+    memset(&rta, 0, sizeof(rta));
+    rta.cfg.version = RTA_CFG_VERSION;
+    rta.cfg.tap = RTA_TAP_OUTPUT;
+    rta.cfg.channel_mask = tap_valid_mask(RTA_TAP_OUTPUT);
+#if PICO_RP2350
+    rta.cfg.fft_order = 10;
+#else
+    rta.cfg.fft_order = 9;
+#endif
+    rta.cfg.avg_ms = 250;
+    rta.cfg.peak_decay_db_s = 20;
+    rta.stat_window_us = time_us_32();
+    derive_layout();
+    stop_engine();
+}

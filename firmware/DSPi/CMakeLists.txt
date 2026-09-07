@@ -76,6 +76,11 @@ add_executable(DSPi
     subharm.h
     siggen.c
     siggen.h
+    rta.c
+    rta.h
+    rta_fft.c
+    rta_fft.h
+    rta_tables.h
     spdif_input.c
     spdif_input.h
     uart_control.c

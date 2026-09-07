@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include "pdm_generator.h"
+#include "rta.h"
 #include "dsp_pipeline.h"
 #include "crossover.h"
 #include "usb_audio.h"
@@ -599,6 +600,7 @@ static void __not_in_flash_func(eq_worker_loop)() {
             }
             global_status.peaks[CH_OUT_1 + out] = (uint16_t)(fminf(1.0f, peak) * 32767.0f);
             if (peak > CLIP_THRESH_F) global_status.clip_flags |= (1u << (CH_OUT_1 + out));
+            rta_tap(RTA_TAP_OUTPUT, (uint8_t)out, buf_out[out], sample_count);
         }
 
         // Finalize Core 1's outputs (see output_s24.h), using Core 0's
@@ -795,6 +797,7 @@ static void __not_in_flash_func(eq_worker_loop)() {
             }
             global_status.peaks[CH_OUT_1 + out] = (uint16_t)(peak >> 13);
             if (peak > CLIP_THRESH_Q28) global_status.clip_flags |= (1u << (CH_OUT_1 + out));
+            rta_tap(RTA_TAP_OUTPUT, (uint8_t)out, buf_out[out], sample_count);
         }
 
         // S/PDIF conversion for Core 1's pair (outputs 2-3 → int32 24-bit)

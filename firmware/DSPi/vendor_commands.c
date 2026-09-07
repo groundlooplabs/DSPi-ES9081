@@ -34,6 +34,7 @@
 #include "build_info.h"
 #include "pdm_generator.h"
 #include "siggen.h"
+#include "rta.h"
 #include "upmix.h"
 #include "adat_output.h"
 #include "adat_input.h"
@@ -159,6 +160,14 @@ bool vendor_is_bulk_set(uint8_t bRequest, uint16_t wLength) {
            wLength >= WIRE_BULK_PARAMS_MIN_SIZE &&
            wLength <= sizeof(WireBulkParams);
 }
+
+// GETs that answer out of bulk_param_buf across several EP0 packets: the
+// lock is taken at SETUP and held to the ACK, so all three sites must agree.
+static inline bool vendor_is_bulk_get(uint8_t bRequest) {
+    return bRequest == REQ_GET_ALL_PARAMS || bRequest == REQ_RTA_GET_BANDS_ALL;
+}
+_Static_assert(RTA_MAX_TRACKED * sizeof(RtaBandFrame) <= WIRE_BULK_BUF_SIZE,
+               "REQ_RTA_GET_BANDS_ALL must fit bulk_param_buf");
 
 // --- Chunked bulk-params sessions (USB only; see 0xA2/0xA3 in config.h) ---
 // A session spans multiple EP0 control transfers, so the bulk lock must
@@ -1753,6 +1762,14 @@ static bool vendor_handle_set_data(tusb_control_request_t const *req) {
             }
             break;
 
+        case REQ_RTA_SET_CONFIG:
+            // rta_set_config validates version, length, tap, order
+            // and mask; STALL on reject so external transports see ERROR.
+            if (!rta_set_config(vendor_rx_buf, buffer->data_len)) {
+                handled = false;
+            }
+            break;
+
         // ---- Stereo upmixer (RP2350 only) ----
         case REQ_UPMIX_SET_CONFIG:
 #if !PICO_RP2350
@@ -1901,6 +1918,10 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
     {
         // Device -> Host (GET requests)
         static uint8_t resp_buf[64];
+        // RTA staging: RtaBandFrame (80 B) does not fit resp_buf, and the
+        // caps band-centre chunk is 64 B.  Static, so USB sends from it.
+        static uint8_t rta_resp_buf[sizeof(RtaBandFrame)];
+        _Static_assert(sizeof(rta_resp_buf) >= 64, "RTA caps chunk staging");
 
         switch (setup->bRequest) {
             case REQ_GET_PREAMP: {
@@ -4168,6 +4189,109 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
                 vendor_send_response(resp_buf, 1);
                 return true;
             }
+
+            // ---- Spectrum analyser (RTA / FFT), 0x08-0x0F ----
+            // Responses are staged in rta_resp_buf because RtaBandFrame is
+            // 80 bytes, past the 64-byte resp_buf above.
+            case REQ_RTA_GET_CONFIG: {
+                RtaConfig cfg;
+                rta_get_config(&cfg);
+                memcpy(rta_resp_buf, &cfg, sizeof(cfg));
+                vendor_send_response(rta_resp_buf, sizeof(cfg));
+                return true;
+            }
+
+            case REQ_RTA_GET_CAPS: {
+                // wValue 0 = the caps header; 1.. = band-centre table chunks.
+                if (setup->wValue == 0) {
+                    RtaCaps caps;
+                    rta_get_caps(&caps);
+                    memcpy(rta_resp_buf, &caps, sizeof(caps));
+                    vendor_send_response(rta_resp_buf, sizeof(caps));
+                    return true;
+                }
+                // Reject a set high byte instead of aliasing it to a chunk.
+                if (setup->wValue > 0xFF) return false;
+                uint16_t n = rta_get_caps_centres((uint8_t)setup->wValue,
+                                                  rta_resp_buf);
+                if (n == 0) return false;   // chunk past the end of the table
+                vendor_send_response(rta_resp_buf, n);
+                return true;
+            }
+
+            case REQ_RTA_GET_BANDS: {
+                // Counts as a read: keepalive for auto-off, auto-start unless
+                // the config asked for MANUAL.
+                rta_note_read();
+                if (setup->wValue > 0xFF) return false;
+                RtaBandFrame frame;
+                if (!rta_get_band_frame((uint8_t)setup->wValue, &frame)) {
+                    return false;
+                }
+                memcpy(rta_resp_buf, &frame, sizeof(frame));
+                vendor_send_response(rta_resp_buf, sizeof(frame));
+                return true;
+            }
+
+            case REQ_RTA_GET_BINS: {
+                // wValue = byte offset, wLength = chunk size.  No lock: the
+                // frame carries a seq head and tail for the host to compare.
+                rta_note_read();
+                uint16_t flen = 0;
+                const uint8_t *frame = rta_bin_frame(&flen);
+                uint16_t off = setup->wValue;
+                if (frame == NULL || flen == 0 || off >= flen) return false;
+                uint16_t n = (uint16_t)(flen - off);
+                if (setup->wLength && setup->wLength < n) n = setup->wLength;
+                // Engine-owned static storage, so USB can send from it and an
+                // external transport's copy stays inside its own cap.
+                vendor_send_response(frame + off, n);
+                return true;
+            }
+
+            case REQ_RTA_GET_STATUS: {
+                // Deliberately not a read: polling status must not keep the
+                // analyser alive or start it.
+                RtaStatus st;
+                rta_get_status(&st);
+                memcpy(rta_resp_buf, &st, sizeof(st));
+                vendor_send_response(rta_resp_buf, sizeof(st));
+                return true;
+            }
+
+            case REQ_RTA_CONTROL: {
+                // Parameterless action in wValue (RTA_CTL_*), acknowledged
+                // with one status byte like REQ_SIGGEN_CONTROL.
+                if (!rta_control((uint8_t)(setup->wValue & 0xFF))) {
+                    return false;
+                }
+                resp_buf[0] = 1;
+                vendor_send_response(resp_buf, 1);
+                return true;
+            }
+
+            case REQ_RTA_GET_BANDS_ALL: {
+                // USB only: the response outgrows the external transports'
+                // 132-byte GET cap, so they poll 0x0B per channel.  Caller
+                // (the USB SETUP path) holds the bulk lock; see vendor_is_bulk_get.
+                if (_active_source != CTRL_SOURCE_USB) return false;
+                rta_note_read();
+                uint16_t mask = rta_live_mask();
+                uint16_t len = 0;
+                for (uint8_t i = 0; i < RTA_MAX_TRACKED; i++) {
+                    if (!(mask & (1u << i))) continue;
+                    // Packed struct, so byte alignment in the buffer is fine.
+                    RtaBandFrame *dst = (RtaBandFrame *)&bulk_param_buf[len];
+                    if (!rta_get_band_frame(i, dst)) memset(dst, 0, sizeof(*dst));
+                    len = (uint16_t)(len + sizeof(*dst));
+                }
+                // An empty live mask answers with a zero-length data stage
+                // rather than a STALL, so the host can tell "nothing live"
+                // from "command rejected".
+                if (setup->wLength < len) len = setup->wLength;
+                return tud_control_xfer(_vendor_rhport, _vendor_current_req,
+                                        bulk_param_buf, len);
+            }
         }
 
         return false;
@@ -4233,13 +4357,13 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage,
             // Bulk GET streams from bulk_param_buf across many EP0 packets
             // after the handler returns; hold the lock until ACK so an
             // external transport can't re-collect into it mid-stream.
-            if (req->bRequest == REQ_GET_ALL_PARAMS &&
+            if (vendor_is_bulk_get(req->bRequest) &&
                 !vendor_bulk_try_acquire(CTRL_SOURCE_USB)) {
                 return false;
             }
             // GET path — dispatches into the legacy switch.
             bool ok = vendor_handle_get(req);
-            if (!ok && req->bRequest == REQ_GET_ALL_PARAMS) {
+            if (!ok && vendor_is_bulk_get(req->bRequest)) {
                 vendor_bulk_release(CTRL_SOURCE_USB);
             }
             if (!ok && req->bRequest == REQ_GET_ALL_PARAMS_CHUNK) {
@@ -4336,7 +4460,7 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage,
             vendor_bulk_release(CTRL_SOURCE_USB);
         }
         if (req->bmRequestType_bit.direction == TUSB_DIR_IN &&
-            req->bRequest == REQ_GET_ALL_PARAMS) {
+            vendor_is_bulk_get(req->bRequest)) {
             vendor_bulk_release(CTRL_SOURCE_USB);   // bulk GET fully streamed
         }
         if (req->bmRequestType_bit.direction == TUSB_DIR_OUT &&

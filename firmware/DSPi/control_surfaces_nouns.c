@@ -289,13 +289,13 @@ const CsNounDesc cs_noun_table[CS_NOUN_COUNT] = {
                                   CS_ACT_BIT(CS_ACT_STEP) | CS_ACT_BIT(CS_ACT_INC) |
                                   CS_ACT_BIT(CS_ACT_DEC) | CS_ACT_BIT(CS_ACT_TOGGLE),
                                   0, 0, CS_UNIT_NONE, CS_TARGET_NONE, 0, 0 },
-    // Aux outputs (caps v17): user values with no audio meaning, so a
-    // physical pin follows them through an ordinary LED / PWM LED binding.
+    // Aux outputs (caps v18): target = the binding slot holding the
+    // CS_TYPE_AUX_* component (AUX_LEVEL needs the PWM kind).
     [CS_NOUN_AUX]             = { CS_KIND_BOOL, 0, CS_BOOL_RW, 0, 0,
-                                  CS_UNIT_NONE, CS_TARGET_AUX, CS_MAX_AUX, 0 },
+                                  CS_UNIT_NONE, CS_TARGET_AUX, CS_MAX_BINDINGS, 0 },
     [CS_NOUN_AUX_LEVEL]       = { CS_KIND_CONTINUOUS, 0, CS_CONT_RW,
                                   0, Q8(100), CS_UNIT_PERCENT,
-                                  CS_TARGET_AUX, CS_MAX_AUX, 0 },
+                                  CS_TARGET_AUX, CS_MAX_BINDINGS, 0 },
 };
 
 // ---------------------------------------------------------------------------
@@ -479,7 +479,7 @@ float cs_noun_get(uint8_t noun, uint8_t target, uint8_t index) {
         case CS_NOUN_DISPLAY_PAGE:       return (float)cs_display_current_page();
         case CS_NOUN_DISPLAY_EDIT:       return cs_display_edit_armed() ? 1.0f : 0.0f;
         case CS_NOUN_AUX:                return control_surfaces_aux_state(target) ? 1.0f : 0.0f;
-        case CS_NOUN_AUX_LEVEL:          return (float)control_surfaces_aux_level(target);
+        case CS_NOUN_AUX_LEVEL:          return (float)control_surfaces_aux_level(target) / 256.0f;
         default: return 0.0f;
     }
 }
@@ -640,26 +640,18 @@ bool cs_noun_dispatch(uint8_t noun, uint8_t target, uint8_t index, float value) 
             r = vendor_dispatch_set(CTRL_SOURCE_GPIO, req, target, 0, &v, 1);
             break;
         }
-        case CS_NOUN_AUX:
-        case CS_NOUN_AUX_LEVEL: {
+        case CS_NOUN_AUX: {
             // Runtime-only values, but still routed through the command
             // surface so the host sees a GPIO-tagged NOTIFY_EVT_CS_AUX.
-            uint8_t v;
-            uint8_t req;
-            if (noun == CS_NOUN_AUX) {
-                v = (value >= 0.5f) ? 1 : 0;
-                req = REQ_SET_CS_AUX_STATE;
-            } else {
-                // Whole percent on the wire.  A step under 0.5 % would round
-                // back onto the live integer and stall an encoder, so a
-                // requested change always moves at least one unit its way.
-                uint8_t cur = control_surfaces_aux_level(target);
-                v = (value <= 0.0f) ? 0 : (value >= 100.0f) ? 100 : (uint8_t)(value + 0.5f);
-                if (v == cur && value > (float)cur && cur < 100) v = cur + 1;
-                else if (v == cur && value < (float)cur && cur > 0) v = cur - 1;
-                req = REQ_SET_CS_AUX_LEVEL;
-            }
-            r = vendor_dispatch_set(CTRL_SOURCE_GPIO, req, target, 0, &v, 1);
+            uint8_t v = (value >= 0.5f) ? 1 : 0;
+            r = vendor_dispatch_set(CTRL_SOURCE_GPIO, REQ_SET_CS_AUX_STATE, target, 0, &v, 1);
+            break;
+        }
+        case CS_NOUN_AUX_LEVEL: {
+            float q = value * 256.0f + 0.5f;
+            uint16_t lv = (q <= 0.0f) ? 0 : (q >= 25600.0f) ? 25600 : (uint16_t)q;
+            uint8_t v[2] = { (uint8_t)(lv & 0xFF), (uint8_t)(lv >> 8) };
+            r = vendor_dispatch_set(CTRL_SOURCE_GPIO, REQ_SET_CS_AUX_LEVEL, target, 0, v, 2);
             break;
         }
         default: {
@@ -704,10 +696,20 @@ uint8_t cs_noun_validate_target_ch(uint8_t noun, uint8_t ch, uint8_t index) {
         case CS_TARGET_INPUT_CH:
         case CS_TARGET_OUTPUT_CH:
         case CS_TARGET_DSP_CH:
-        case CS_TARGET_AUX:
             if (ch >= nd->target_count || index != 0)
                 return CS_STATUS_INVALID_TARGET;
             return PIN_CONFIG_SUCCESS;
+        case CS_TARGET_AUX: {
+            // Strict: the slot must hold an aux output now (aux slots load
+            // first at boot), and the level noun needs the PWM kind.
+            if (ch >= nd->target_count || index != 0)
+                return CS_STATUS_INVALID_TARGET;
+            uint8_t t = control_surfaces_slot_type(ch);
+            bool ok = (noun == CS_NOUN_AUX_LEVEL)
+                    ? (t == CS_TYPE_AUX_PWM)
+                    : (t == CS_TYPE_AUX_OUT || t == CS_TYPE_AUX_PWM);
+            return ok ? PIN_CONFIG_SUCCESS : CS_STATUS_INVALID_AUX;
+        }
         case CS_TARGET_DSP_BAND: {
             if (ch >= nd->target_count) return CS_STATUS_INVALID_TARGET;
             bool peq = (index < channel_band_counts[ch]);

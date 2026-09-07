@@ -226,8 +226,8 @@ giving smooth, jitter-free knob behavior without flooding the dispatcher.
 
 | Off | Size | Field | Meaning |
 |----|------|-------|---------|
-| 0 | 1 | `type` | `CsType` (0-7); `0` = slot cleared |
-| 1 | 1 | `noun` | `CsNoun` (0-51) |
+| 0 | 1 | `type` | `CsType` (0-10); `0` = slot cleared |
+| 1 | 1 | `noun` | `CsNoun` (0-69 at caps v18; read `noun_count`) |
 | 2 | 1 | `action` | `CsAction` (0-11) |
 | 3 | 1 | `flags` | `CS_FLAG_*` bitfield (see 2.2.1); unknown bits are rejected with `CS_STATUS_INVALID_VALUE` |
 | 4 | 1 | `gpio[0]` | primary GPIO |
@@ -235,14 +235,15 @@ giving smooth, jitter-free knob behavior without flooding the dispatcher.
 | 6 | 1 | `event` | `CsEvent` (buttons: 0 = press, 1 = long, 2 = double); MUST be 0 for other types |
 | 7 | 1 | `target` | channel address for targeted nouns (section 4.4); 0 otherwise |
 | 8 | 1 | `index` | filter band for `CS_TARGET_DSP_BAND` nouns; 0 otherwise |
-| 9 | 1 | `base_bright` | caps v12: brightness ceiling, percent 1-100; `0` = unset = full. `CS_TYPE_LED_PWM` only, rejected non-zero elsewhere |
+| 9 | 1 | `base_bright` | caps v12: brightness ceiling, percent 1-100; `0` = unset = full. PWM types (`CS_TYPE_LED_PWM`, `CS_TYPE_AUX_PWM`) only, rejected non-zero elsewhere |
 | 10 | 2 | `value` (int16) | `SET`/`MOMENTARY` target, `IND_EQUALS`/`IND_ABOVE` comparand; unit-encoded (2.1) |
 | 12 | 2 | `step` (int16) | `STEP`/`INC`/`DEC` size; `0` = the unit default (2.1) |
 | 14 | 2 | `range_min` (int16) | pot / `IND_LEVEL` span low end; both range fields `0` = the noun's full range |
 | 16 | 2 | `range_max` (int16) | pot / `IND_LEVEL` span high end |
-| 18 | 2 | `on_delay` (uint16) | caps v8: raw condition must hold true this long before the LED turns on; 0.1 s units, 0 = immediate. LED types with `IND_EQUALS`/`IND_ABOVE` only; rejected non-zero elsewhere |
+| 18 | 2 | `on_delay` (uint16) | caps v8: raw condition must hold true this long before the LED turns on; 0.1 s units, 0 = immediate. LED types with `IND_EQUALS`/`IND_ABOVE` and the aux output types only; rejected non-zero elsewhere |
 | 20 | 2 | `off_delay` (uint16) | caps v8: raw condition must hold false this long before the LED turns off; same rules |
-| 22 | 2 | `reserved2[2]` | write 0 (rejected non-zero); earmarked for an LED-extras flags byte, since `flags` has no free bit |
+| 22 | 1 | `extras` | caps v18: type-extras flags. `CS_AUX_X_*` on `CS_TYPE_AUX_OUT`/`CS_TYPE_AUX_PWM` slots (boot state, boot-saved, linear duty; `control_surfaces_aux_spec.md`); write 0 on every other type, rejected non-zero |
+| 23 | 1 | `reserved2` | write 0 (rejected non-zero) |
 
 #### 2.2.1 Flags
 
@@ -269,7 +270,7 @@ the firmware stores and what `REQ_GET_ALL_PARAMS` does **not** contain.
 | 1 | 3 | `reserved[3]` | 0 |
 | 4 | 384 | `bindings[16]` | sixteen 24-byte `CsBinding` records |
 
-### 2.4 `CsTypeDesc` (4 bytes) and `CsCapsHeader` (40 bytes)
+### 2.4 `CsTypeDesc` (4 bytes) and `CsCapsHeader` (52 bytes)
 
 `CsTypeDesc`:
 
@@ -283,30 +284,34 @@ the firmware stores and what `REQ_GET_ALL_PARAMS` does **not** contain.
 
 | Off | Size | Field | Meaning |
 |----|------|-------|---------|
-| 0 | 1 | `caps_version` | capability format version (17) |
+| 0 | 1 | `caps_version` | capability format version (18) |
 | 1 | 1 | `max_bindings` | `CS_MAX_BINDINGS` (16) |
-| 2 | 1 | `type_count` | `CS_TYPE_COUNT` (9); the type table has this many entries, indexed by `CsType` |
+| 2 | 1 | `type_count` | `CS_TYPE_COUNT` (11); the type table has this many entries, indexed by `CsType` |
 | 3 | 1 | `noun_count` | `CS_NOUN_COUNT` (70) |
-| 4 | 32 | `types[8]` | eight `CsTypeDesc`, one per `CsType` including index 0 (`NONE`, all-zero) |
-| 36 | 1 | `max_ir_commands` | `CS_MAX_IR_COMMANDS` (16) |
-| 37 | 3 | `reserved[3]` | 0 |
+| 4 | 44 | `types[11]` | eleven `CsTypeDesc`, one per `CsType` including index 0 (`NONE`, all-zero) |
+| 48 | 1 | `max_ir_commands` | `CS_MAX_IR_COMMANDS` (16) |
+| 49 | 1 | `max_groups` | `CS_MAX_GROUPS` (8) |
+| 50 | 1 | `max_macros` | `CS_MAX_MACROS` (8) |
+| 51 | 1 | `max_macro_steps` | `CS_MAX_MACRO_STEPS` (8) |
 
-Total `4 + 4*8 + 4 = 40` bytes. The v3 tail fields sit **after** the
+Total `4 + 4*11 + 4 = 52` bytes. The v3 tail fields sit **after** the
 variable-length type table; a host locates them at offset
-`4 + 4*type_count`, so a future type-table growth does not move them
-relative to the table end.
+`4 + 4*type_count`, so a type-table growth does not move them relative to the
+table end. Caps v18 is exactly such a growth, from 9 entries to 11.
 
 The `CS_TYPE_IR` type descriptor's action mask describes what its
 **commands** may do (the button action set); the container binding itself
 carries `noun = action = 0` (section 2.7).
 
-Caps v17 adds no header field. The auxiliary outputs it introduces are
-discovered from the version byte and counted from `target_count` in the
-descriptors for nouns 68 and 69 (`control_surfaces_aux_spec.md`).
+Caps v18 adds no header field beyond the two type-table entries. It adds the
+auxiliary output component types `CS_TYPE_AUX_OUT` (9) and `CS_TYPE_AUX_PWM`
+(10), both containers with an all-zero action mask, one pin and pin class ANY.
+Nouns 68 and 69 target the binding slot holding one, so their `target_count`
+reads `max_bindings`. See `control_surfaces_aux_spec.md`.
 
 ### 2.5 `CsNounDesc` (12 bytes)
 
-Returned by `REQ_GET_CS_CAPS` with `wValue = noun index` (0-51).
+Returned by `REQ_GET_CS_CAPS` with `wValue = noun index` (0..`noun_count`-1, 0-69 at caps v18).
 
 | Off | Size | Field | Meaning |
 |----|------|-------|---------|
@@ -398,10 +403,12 @@ and is not part of `WireBulkParams`.
 
 The caps v9 group and macro commands `0x20`-`0x26` follow the same conventions
 but are documented in `control_surfaces_groups_macros_spec.md`; `REQ_CS_SAVE`
-and `REQ_CS_REVERT` below cover their config too. The caps v17 auxiliary
-output commands `0x02`-`0x07` are specified in
-`control_surfaces_aux_spec.md`, and `REQ_CS_SAVE` / `REQ_CS_REVERT` cover the
-aux config too.
+and `REQ_CS_REVERT` below cover their config too. The caps v18 auxiliary
+output runtime commands `0x04`-`0x07` are specified in
+`control_surfaces_aux_spec.md`. An auxiliary output's configuration is an
+ordinary binding, so `REQ_SET_CS_BINDING`, `REQ_SET_CS_NAME`, `REQ_CS_SAVE`
+and `REQ_CS_REVERT` cover it with no special case. Its live on/off flag and
+level are runtime values, never dirty, and are carried across a revert.
 
 | Command | Code | Dir | wValue | wLength / payload | Response |
 |---------|------|-----|--------|-------------------|----------|
@@ -497,7 +504,7 @@ Surfaces extends it from `0x10`.
 | `0x1C` | `CS_STATUS_FLASH_ERROR` | the directory persist failed (`REQ_CS_SAVE`) |
 | `0x1D` | `CS_STATUS_IR_IN_USE` | another slot already holds the IR component (one receiver per device) |
 | `0x1E` | `CS_STATUS_NO_IR` | learn was armed with no live `CS_TYPE_IR` binding |
-| `0x26` | `CS_STATUS_INVALID_AUX` | aux index >= 8 on `REQ_SET_CS_AUX_CFG` (`control_surfaces_aux_spec.md`) |
+| `0x26` | `CS_STATUS_INVALID_AUX` | the target slot is not an auxiliary output, or `CS_NOUN_AUX_LEVEL` targets a non-PWM aux slot (`control_surfaces_aux_spec.md`) |
 
 ### 3.4 Per-slot names (`REQ_SET_CS_NAME` / `REQ_GET_CS_NAME`)
 
@@ -641,6 +648,15 @@ pins -> PWM slice.
 | `CS_TYPE_LED` | 5 | `IND_EQUALS`, `IND_ABOVE` | `0x0500` | 1 | ANY |
 | `CS_TYPE_LED_PWM` | 6 | `IND_EQUALS`, `IND_ABOVE`, `IND_LEVEL` | `0x0D00` | 1 | ANY |
 | `CS_TYPE_IR` | 7 | `INC`, `DEC`, `TOGGLE`, `SET`, `TRIGGER`, `MOMENTARY` (its **commands**; the container binding carries `noun = action = 0`) | `0x02BC` | 1 | ANY |
+| `CS_TYPE_DISPLAY` | 8 | (none; **container**, content set with `0x27`-`0x2B`) | `0x0000` | 2 | ANY |
+| `CS_TYPE_AUX_OUT` | 9 | (none; **container**, driven through `CS_NOUN_AUX`) | `0x0000` | 1 | ANY |
+| `CS_TYPE_AUX_PWM` | 10 | (none; **container**, driven through `CS_NOUN_AUX` and `CS_NOUN_AUX_LEVEL`) | `0x0000` | 1 | ANY |
+
+A container type owns its pins and carries no noun or action of its own.
+Controls address it by noun instead, which is why its action mask is
+`0x0000`. `CS_TYPE_DISPLAY` is specified in
+`control_surfaces_display_spec.md`, the two auxiliary output types in
+`control_surfaces_aux_spec.md`.
 
 Action bit positions (`CS_ACT_BIT(a) = 1 << a`): `ADJUST`=0, `STEP`=1, `INC`=2,
 `DEC`=3, `TOGGLE`=4, `SET`=5, `FOLLOW`=6, `TRIGGER`=7, `IND_EQUALS`=8,
@@ -724,8 +740,8 @@ Action-mask groups used below:
 | `SUBHARM_LOW` | 58 | CONT | DB | -30..+6 dB (-30 = band off) | - | CONT-RW |
 | `SUBHARM_HIGH` | 59 | CONT | DB | -30..+6 dB (-30 = band off) | - | CONT-RW |
 | `SUBHARM_BOOST` | 60 | CONT | DB | 0..+6 dB | - | CONT-RW |
-| `AUX` | 68 | BOOL | - | user on/off, no audio meaning | AUX | BOOL-RW |
-| `AUX_LEVEL` | 69 | CONT | PERCENT | 0..100 % | AUX | CONT-RW |
+| `AUX` | 68 | BOOL | - | auxiliary output on/off, no audio meaning | AUX | BOOL-RW |
+| `AUX_LEVEL` | 69 | CONT | PERCENT | 0..100 % (`CS_TYPE_AUX_PWM` slots only) | AUX | CONT-RW |
 
 The *effective* legal action set for a (type, noun) pair is the bitwise AND of
 its two masks. Example: an encoder (`STEP` only) on `USER_MUTE` (bool, no
@@ -745,7 +761,7 @@ input channels and 9 outputs, RP2040 has 2 and 5).
 | `CS_TARGET_OUTPUT_CH` | 2 | output channel 0..N-1 | (must be 0) |
 | `CS_TARGET_DSP_CH` | 3 | DSP channel (inputs first, then outputs) | (must be 0) |
 | `CS_TARGET_DSP_BAND` | 4 | DSP channel | filter band |
-| `CS_TARGET_AUX` | 5 | aux output 0..7 | (must be 0) |
+| `CS_TARGET_AUX` | 5 | binding slot 0..15 holding a `CS_TYPE_AUX_OUT` / `CS_TYPE_AUX_PWM` component | (must be 0) |
 
 Valid bands for `CS_TARGET_DSP_BAND`: PEQ bands `0..channel_band_counts-1`
 (currently 10 per channel), plus, for `FILTER_FREQ` and `FILTER_BYPASS` only,
@@ -818,8 +834,8 @@ target and dispatches it.
 | `PRESET_RELOAD` | `REQ_PRESET_LOAD` (`0x91`, GET, wValue = active slot) | `TRIGGER` reloads the currently active preset from flash via the deferred pipeline-safe path, discarding unsaved live edits. Device-global state (master volume in independent mode, output config, CS bindings) is untouched. |
 | `LOUDNESS_SPL` | `REQ_SET_LOUDNESS_REF` (`0x5A`, float dB SPL) | Reference listening level 40..100 dB SPL: the level at which the ISO 226 compensation reads flat. Lower it and the curve engages sooner as volume drops. |
 | `LOUDNESS_INTENSITY` | `REQ_SET_LOUDNESS_INTENSITY` (`0x5C`, float %) | Compensation depth, 100 % = the full ISO 226 contour difference. The vendor command accepts 0..200 %, but 8.8 percent caps the bindable span at 0..127 %. |
-| `AUX` | `REQ_SET_CS_AUX_STATE` (`0x04`, wValue = `target`, uint8 0/1) | Auxiliary output on/off; a user value with no audio meaning. See `control_surfaces_aux_spec.md`. |
-| `AUX_LEVEL` | `REQ_SET_CS_AUX_LEVEL` (`0x06`, wValue = `target`, uint8 0..100) | Auxiliary output level in whole percent, rounded from the noun value and clamped at 100. |
+| `AUX` | `REQ_SET_CS_AUX_STATE` (`0x04`, wValue = `target` = the aux slot, uint8 0/1) | Auxiliary output on/off; a pin with no audio meaning. See `control_surfaces_aux_spec.md`. |
+| `AUX_LEVEL` | `REQ_SET_CS_AUX_LEVEL` (`0x06`, wValue = `target` = the aux slot, uint16 LE 8.8 percent) | Auxiliary PWM output level, clamped at 100 % (25600). No rounding to whole percent, so any `step` is valid. |
 
 ### 5.1 Enum stepping detail
 
@@ -965,20 +981,21 @@ so rapid detents on two different filter knobs cannot overwrite each other.
   binding starts "off" and counts `on_delay` from activation if its
   condition is already true. Delays on `IND_LEVEL` or any non-LED type are
   rejected with `CS_STATUS_INVALID_VALUE`.
-- An LED may follow `CS_NOUN_AUX` (`IND_EQUALS`, `value = 1`) to turn a
-  user-defined auxiliary output into a real pin for a relay or amplifier
-  trigger, with `CS_FLAG_INVERT` for active-low modules and the delays above
-  for warm-up or hold-off. See `control_surfaces_aux_spec.md`.
+- An LED may optionally follow `CS_NOUN_AUX` (`IND_EQUALS`, `value = 1`) as an
+  extra indicator that an auxiliary output is on. Since caps v18 the aux
+  output owns its own pin, so this is decoration rather than the mechanism.
+  See `control_surfaces_aux_spec.md`.
 
 ### 6.6 PWM LEDs (1 GPIO, hardware PWM)
 
 - `CS_TYPE_LED_PWM` drives the LED from the pin's hardware PWM slice
-  (wrap 4095 at sysclk/16, a ~2 kHz carrier). Nothing else in the firmware
-  uses PWM, so all slices are free; still, two PWM LEDs must not land on the
+  (wrap 4095 at sysclk/16, a ~2 kHz carrier). Only Control Surfaces uses PWM,
+  so all slices are free; still, two PWM components must not land on the
   same **slice+channel output** (e.g. GPIO 0 and GPIO 16 are both slice 0
   channel A on RP2040); that is rejected with `CS_STATUS_PWM_CONFLICT`.
-  Two PWM LEDs on the same slice but different channels (e.g. GPIO 0 and 1)
-  are fine.
+  Two on the same slice but different channels (e.g. GPIO 0 and 1) are fine.
+  `CS_TYPE_AUX_PWM` counts as a PWM component here and shares the same
+  carrier, conflict rule and slice-release rule.
 - Actions: `IND_LEVEL` (brightness follows the noun value across the noun
   range or the custom `[range_min, range_max]` span, with a squared
   perceptual curve; a per-channel VU-style meter LED is `LEVEL` +
@@ -991,17 +1008,19 @@ so rapid detents on two different filter knobs cannot overwrite each other.
   would round a 1% ceiling to fully off at wrap 4095). It is applied before
   `CS_FLAG_INVERT`, so an active-low LED keeps a full-rail off state.
   A future global Panel Brightness noun is intended to multiply into this
-  per-LED value for LEDs that opt in, via a flags byte from `reserved2`.
+  per-LED value for LEDs that opt in, via bits in the `extras` byte at offset
+  22 (caps v18 uses that byte only on the auxiliary output types).
 - **`CS_FLAG_INVERT`** inverts the duty cycle for active-low wiring.
 - Refresh is decimated like plain LEDs (8 ms); brightness changes are applied
   only when the computed level changes.
 - `on_delay`/`off_delay` (6.5) apply to the `IND_EQUALS`/`IND_ABOVE` full-on/off
   actions; they are rejected on `IND_LEVEL` (a continuous level has no boolean
   edge to time).
-- A PWM LED may follow `CS_NOUN_AUX_LEVEL` (`IND_LEVEL`) to dim external
-  hardware from a user-defined auxiliary output, with the same perceptual
-  curve, `base_bright` ceiling and `range_min`/`range_max` span. See
-  `control_surfaces_aux_spec.md`.
+- A PWM LED may optionally follow `CS_NOUN_AUX_LEVEL` (`IND_LEVEL`) as an
+  extra indicator of an auxiliary output's level, with the same perceptual
+  curve, `base_bright` ceiling and `range_min`/`range_max` span. Since caps
+  v18 a `CS_TYPE_AUX_PWM` slot dims its own pin, so this is decoration rather
+  than the mechanism. See `control_surfaces_aux_spec.md`.
 
 ### 6.7 Poll budget
 
@@ -1149,13 +1168,16 @@ makes push the normal `PARAM_CHANGED` with `source = PARAM_SRC_GPIO`.
 ## 8. App integration patterns
 
 All multi-byte fields little-endian. `slot` is 0-15. Field offsets per 2.2:
-`type,noun,action,flags @0-3`, `gpio @4-5`, `event,target,index,rsv @6-9`,
-`value @10`, `step @12`, `range_min @14`, `range_max @16`, `reserved2 @18-23`.
+`type,noun,action,flags @0-3`, `gpio @4-5`, `event,target,index @6-8`,
+`base_bright @9`, `value @10`, `step @12`, `range_min @14`, `range_max @16`,
+`on_delay @18`, `off_delay @20`, `extras @22`, `reserved2 @23`.
 
 ### 8.1 Enumerate capabilities (do this at connect)
 
-1. `GET 0x86, wValue=0xFFFF` -> 32-byte `CsCapsHeader`. Read `type_count`,
-   `noun_count`, `max_bindings`, and the seven `CsTypeDesc` entries.
+1. `GET 0x86, wValue=0xFFFF` -> 52-byte `CsCapsHeader`. Read `type_count`,
+   `noun_count`, `max_bindings`, and the `type_count` `CsTypeDesc` entries.
+   Locate the tail fields at offset `4 + 4*type_count`; never assume a fixed
+   header length.
 2. For each noun `n` in `0 .. noun_count-1`: `GET 0x86, wValue=n` -> 12-byte
    `CsNounDesc`. Cache kind, unit, enum_count, range, target kind/count,
    dflags, and the accepted-action mask. Skip nouns with `actions == 0`.
@@ -1427,18 +1449,29 @@ Caps v9 and later carry their compatibility notes in the companion specs.
 Groups and macros (caps v9, directory V18) are in
 `control_surfaces_groups_macros_spec.md`, the I2C display bundle (caps
 v10-v13, directory V19) in `control_surfaces_display_spec.md`, and auxiliary
-outputs (caps v17, directory V20) in `control_surfaces_aux_spec.md`. Caps
+outputs (caps v18, directory V21) in `control_surfaces_aux_spec.md`. Caps
 v14-v16 appended subharmonic synthesizer nouns and widened three of their
 ranges, with no structure or stored-config change.
 
-**Caps v16 -> v17.** Two nouns are appended (68, 69), one target kind is
-added (`CS_TARGET_AUX` = 5), one status code is added
-(`CS_STATUS_INVALID_AUX` = `0x26`), and six commands are added
-(`0x02`-`0x07`). No existing structure changes size and no existing GET
-changes length, so external clients doing exact-length readback are
-unaffected until they opt into the new commands. The directory grows a
-292-byte block at V20; the V19->V20 migration is a prefix copy with the new
-block zeroed, which reads as every aux output off and unnamed.
+**Caps v17 never shipped.** It modelled auxiliary outputs as a separate table
+of eight pinless on/off + level values (`CsAuxCfg` / `CsAuxConfig`, commands
+`0x02`-`0x07`, directory V20) that an LED binding had to follow to reach a
+pin. No device or host ever ran it. Caps v18 replaces it outright.
+
+**Caps v16 -> v18.** An auxiliary output is a component in a binding slot that
+owns its GPIO. Two type-table entries are appended, `CS_TYPE_AUX_OUT` (9) and
+`CS_TYPE_AUX_PWM` (10), so `CS_TYPE_COUNT` is 11 and `CsCapsHeader` grows from
+44 to 52 bytes. A host that already locates the v3 tail at `4 + 4*type_count`
+needs no change; one that hardcoded the header length does. Two nouns are
+appended (68, 69), one target kind is added (`CS_TARGET_AUX` = 5, addressing
+the binding slot), one status code is added (`CS_STATUS_INVALID_AUX` =
+`0x26`), and four runtime commands are added (`0x04`-`0x07`). `CsBinding` byte
+22 becomes `extras`, which must stay 0 on every non-aux type, so pre-v18
+bindings remain valid unchanged. Every other structure keeps its size and
+every other GET keeps its length, so external clients doing exact-length
+readback are unaffected until they opt in. The directory becomes V21, which is
+byte-identical to V19; the V20 aux table is dropped, so any aux output
+configured on a V20 build is lost and must be recreated as a binding slot.
 
 ### 11.1 v7 -> v8 (caps version 8, directory unchanged)
 

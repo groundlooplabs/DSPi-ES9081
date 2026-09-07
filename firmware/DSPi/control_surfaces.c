@@ -130,11 +130,6 @@ uint8_t          cs_set_macro_step_slot = 0;
 uint8_t          cs_set_macro_step_idx = 0;
 CsMacroStep      cs_set_macro_step_val;
 
-// Deferred aux cfg SET handoff (caps v17)
-volatile bool    cs_set_aux_cfg_pending = false;
-uint8_t          cs_set_aux_cfg_slot = 0;
-CsAuxCfg         cs_set_aux_cfg_val;
-
 // ---------------------------------------------------------------------------
 // Type capability table; the per-noun half lives in control_surfaces_nouns.c.
 // REQ_GET_CS_CAPS serves these verbatim, so host UIs and the firmware can
@@ -142,7 +137,7 @@ CsAuxCfg         cs_set_aux_cfg_val;
 // ---------------------------------------------------------------------------
 
 static const CsCapsHeader s_caps = {
-    .caps_version = 17,
+    .caps_version = 18,
     .max_bindings = CS_MAX_BINDINGS,
     .type_count   = CS_TYPE_COUNT,
     .noun_count   = CS_NOUN_COUNT,
@@ -167,12 +162,24 @@ static const CsCapsHeader s_caps = {
                               1, CS_PINCLASS_ANY },
         // Display container: gpio = SDA/SCL, content via commands 0x27-0x2B.
         [CS_TYPE_DISPLAY] = { 0, 2, CS_PINCLASS_ANY },
+        // Aux output containers (caps v18): the slot IS the output; controls
+        // reach it through CS_NOUN_AUX / CS_NOUN_AUX_LEVEL targeting the slot.
+        [CS_TYPE_AUX_OUT] = { 0, 1, CS_PINCLASS_ANY },
+        [CS_TYPE_AUX_PWM] = { 0, 1, CS_PINCLASS_ANY },
     },
     .max_ir_commands = CS_MAX_IR_COMMANDS,
     .max_groups      = CS_MAX_GROUPS,
     .max_macros      = CS_MAX_MACROS,
     .max_macro_steps = CS_MAX_MACRO_STEPS,
 };
+
+static inline bool cs_type_is_aux(uint8_t t) {
+    return t == CS_TYPE_AUX_OUT || t == CS_TYPE_AUX_PWM;
+}
+// Both PWM types share the slice-conflict and slice-release rules.
+static inline bool cs_type_is_pwm(uint8_t t) {
+    return t == CS_TYPE_LED_PWM || t == CS_TYPE_AUX_PWM;
+}
 
 // ---------------------------------------------------------------------------
 // Live state
@@ -218,6 +225,10 @@ typedef struct {
     uint8_t  led_cond;      // delay-filtered condition the pin follows
     uint32_t led_edge_ms;   // wall-clock ms at the last raw-condition change
     uint16_t pwm_level;     // last written PWM compare level
+    // aux outputs: live on/off flag and 8.8 percent level (runtime, never
+    // dirty; the led_* fields above carry the TON/TOF filter and pin state)
+    uint8_t  aux_on;
+    uint16_t aux_level;
     uint32_t pv_key;        // PAGE_VALUE resolved-item key (session reset)
     CsOpState op;
 } CsRuntime;
@@ -295,12 +306,11 @@ typedef struct {
 
 static CsGroupConfig s_groups;                   // live group table
 
-// Aux outputs (caps v17).  The cfg is the persistence source; state / level
-// are runtime values written from any dispatch context.  Single-byte stores,
-// so the tick, the display and the vendor GETs read them without a lock.
-static CsAuxConfig       s_aux;
-static volatile uint8_t  s_aux_state[CS_MAX_AUX];
-static volatile uint8_t  s_aux_level[CS_MAX_AUX];
+// Aux output value carry (caps v18).  A same-type re-apply of an aux slot and
+// REQ_CS_REVERT stash the live on/off flag and level here so the pin never
+// snaps back to its boot value; cs_seed_runtime consumes the entry.
+typedef struct { uint8_t type; uint8_t on; uint16_t level; } CsAuxCarry;
+static CsAuxCarry s_aux_carry[CS_MAX_BINDINGS];
 static CsMacroConfig s_macros;                   // live macro table
 static uint8_t       s_group_status[CS_MAX_GROUPS];
 static uint8_t       s_macro_status[CS_MAX_MACROS];
@@ -1276,6 +1286,51 @@ static void cs_tick_led_pwm(uint8_t slot) {
     pwm_set_gpio_level(b->gpio[0], level);
 }
 
+// PWM compare level for an aux output: the level only counts while the
+// output is on, the squared curve matches the LED meters unless LINEAR is
+// set, and the ceiling / INVERT are applied exactly as for a PWM LED.
+static uint16_t cs_aux_duty(const CsBinding *b, uint8_t on, uint16_t level_q8) {
+    uint16_t level = 0;
+    if (on) {
+        float norm = (float)level_q8 / (100.0f * 256.0f);
+        if (norm > 1.0f) norm = 1.0f;
+        if (!(b->extras & CS_AUX_X_LINEAR)) norm *= norm;
+        level = (uint16_t)(norm * (float)CS_PWM_WRAP);
+    }
+    if (b->base_bright)
+        level = (uint16_t)(((uint32_t)level * b->base_bright) / 100u);
+    if (b->flags & CS_FLAG_INVERT) level = CS_PWM_WRAP - level;
+    return level;
+}
+
+// The value an aux slot comes up with: a carried live value when one is
+// stashed for this slot and type, else the stored boot fields.
+static void cs_aux_initial(uint8_t slot, uint8_t *on, uint16_t *level) {
+    const CsBinding *b = &s_cfg.bindings[slot];
+    const CsAuxCarry *c = &s_aux_carry[slot];
+    if (c->type == b->type) { *on = c->on; *level = c->level; return; }
+    *on = (b->extras & CS_AUX_X_BOOT_ON) ? 1 : 0;
+    *level = (b->type == CS_TYPE_AUX_PWM) ? (uint16_t)b->value : 0;
+}
+
+// Aux outputs: the pin follows the live on/off flag through the same TON/TOF
+// filter as an indicator; a PWM output emits its level only while on.
+static void cs_tick_aux(uint8_t slot) {
+    const CsBinding *b = &s_cfg.bindings[slot];
+    CsRuntime *rt = &s_rt[slot];
+    uint8_t lit = cs_ind_delay(b, rt, rt->aux_on);
+    if (b->type == CS_TYPE_AUX_OUT) {
+        if (lit == rt->led_lit) return;
+        rt->led_lit = lit;
+        gpio_put(b->gpio[0], (b->flags & CS_FLAG_INVERT) ? !lit : lit);
+        return;
+    }
+    uint16_t level = cs_aux_duty(b, lit, rt->aux_level);
+    if (level == rt->pwm_level) return;
+    rt->pwm_level = level;
+    pwm_set_gpio_level(b->gpio[0], level);
+}
+
 // ---------------------------------------------------------------------------
 // Pin claim / release and validation
 // ---------------------------------------------------------------------------
@@ -1339,6 +1394,27 @@ static void cs_claim_pins(uint8_t slot) {
             // Pin mux, pulls and the I2C peripheral are the module's job.
             cs_display_attach(b);
             break;
+        case CS_TYPE_AUX_OUT: {
+            // Level first, direction second, so a relay never sees the pin
+            // pass through the off state on the way up.
+            uint8_t on; uint16_t lv;
+            cs_aux_initial(slot, &on, &lv);
+            gpio_init(b->gpio[0]);
+            gpio_put(b->gpio[0], (b->flags & CS_FLAG_INVERT) ? !on : on);
+            gpio_set_dir(b->gpio[0], GPIO_OUT);
+            break;
+        }
+        case CS_TYPE_AUX_PWM: {
+            uint8_t on; uint16_t lv;
+            cs_aux_initial(slot, &on, &lv);
+            uint slice = pwm_gpio_to_slice_num(b->gpio[0]);
+            pwm_set_wrap(slice, CS_PWM_WRAP);
+            pwm_set_clkdiv(slice, CS_PWM_CLKDIV);
+            pwm_set_gpio_level(b->gpio[0], cs_aux_duty(b, on, lv));
+            gpio_set_function(b->gpio[0], GPIO_FUNC_PWM);
+            pwm_set_enabled(slice, true);
+            break;
+        }
         default:  // button / switch / encoder / IR inputs (idempotent re-claims OK)
             for (int i = 0; i < cs_pin_count(b->type); i++) {
                 gpio_init(b->gpio[i]);
@@ -1377,13 +1453,13 @@ static void cs_release_pins(uint8_t slot, const CsBinding *b) {
     for (int i = 0; i < cs_pin_count(b->type); i++) {
         uint8_t pin = b->gpio[i];
         if (cs_pin_used_by_other(pin, slot)) continue;
-        if (b->type == CS_TYPE_LED_PWM) {
+        if (cs_type_is_pwm(b->type)) {
             uint slice = pwm_gpio_to_slice_num(pin);
             bool slice_busy = false;
             for (uint8_t s = 0; s < CS_MAX_BINDINGS; s++) {
                 if (s == slot || !s_rt[s].active) continue;
                 const CsBinding *o = &s_cfg.bindings[s];
-                if (o->type == CS_TYPE_LED_PWM &&
+                if (cs_type_is_pwm(o->type) &&
                     pwm_gpio_to_slice_num(o->gpio[0]) == slice)
                     slice_busy = true;
             }
@@ -1419,6 +1495,22 @@ static void cs_seed_runtime(uint8_t slot) {
         case CS_TYPE_LED_PWM:
             rt->pwm_level = 0xFFFF;   // force the first write
             break;
+        case CS_TYPE_AUX_OUT:
+        case CS_TYPE_AUX_PWM: {
+            uint8_t on; uint16_t lv;
+            cs_aux_initial(slot, &on, &lv);
+            s_aux_carry[slot].type = CS_TYPE_NONE;   // consumed
+            rt->aux_on = on;
+            rt->aux_level = lv;
+            // The claim already drove this value, so the delay filter and
+            // the last-written state start in agreement with the pin.
+            rt->led_raw = on;
+            rt->led_cond = on;
+            rt->led_lit = on;
+            rt->led_edge_ms = (uint32_t)(time_us_64() / 1000u);
+            rt->pwm_level = cs_aux_duty(b, on, lv);
+            break;
+        }
         case CS_TYPE_IR:
             cs_ir_attach(b->gpio[0], (b->flags & CS_FLAG_INVERT) != 0);
             s_ir_slot = slot;
@@ -1496,10 +1588,6 @@ static uint8_t cs_validate_values(const CsBinding *b, const CsNounDesc *nd) {
                 (b->value < nd->min_q || b->value > nd->max_q))
                 return CS_STATUS_INVALID_VALUE;
             if (b->step < 0) return CS_STATUS_INVALID_VALUE;
-            // AUX_LEVEL lives as whole percent; a fractional step would
-            // round back onto the live value on one side and stall there.
-            if (b->noun == CS_NOUN_AUX_LEVEL && (b->step % 256) != 0)
-                return CS_STATUS_INVALID_VALUE;
             if ((b->action == CS_ACT_ADJUST || b->action == CS_ACT_IND_LEVEL) &&
                 (b->range_min != 0 || b->range_max != 0)) {
                 if (b->range_min >= b->range_max ||
@@ -1568,6 +1656,25 @@ static uint8_t cs_validate_display_container(const CsBinding *b, uint8_t slot) {
     return PIN_CONFIG_SUCCESS;
 }
 
+// Aux output containers: the pin, its sense, delays, ceiling, boot fields
+// and extras are the only payload; controls address the slot by noun.
+static uint8_t cs_validate_aux_container(const CsBinding *b) {
+    if (b->noun != 0 || b->action != 0 || b->event != 0 ||
+        b->target != 0 || b->index != 0 ||
+        b->step != 0 || b->range_min != 0 || b->range_max != 0)
+        return CS_STATUS_INVALID_VALUE;
+    if (b->flags & (uint8_t)~CS_FLAG_INVERT) return CS_STATUS_INVALID_VALUE;
+    if (b->extras & (uint8_t)~CS_AUX_X_MASK) return CS_STATUS_INVALID_VALUE;
+    if (b->type == CS_TYPE_AUX_OUT) {
+        // A digital output has no level, no curve and no ceiling.
+        if (b->value != 0 || b->base_bright != 0 || (b->extras & CS_AUX_X_LINEAR))
+            return CS_STATUS_INVALID_VALUE;
+    } else if (b->value < 0 || b->value > cs_noun_table[CS_NOUN_AUX_LEVEL].max_q) {
+        return CS_STATUS_INVALID_VALUE;
+    }
+    return PIN_CONFIG_SUCCESS;
+}
+
 // Full validity check for a proposed binding.  Pin checks run against the
 // live device with this slot's own pins already released by the caller.
 static uint8_t cs_validate(const CsBinding *b, uint8_t slot) {
@@ -1578,18 +1685,21 @@ static uint8_t cs_validate(const CsBinding *b, uint8_t slot) {
     uint8_t gst = cs_validate_group_flags(b->flags, b->action,
                                           &cs_noun_table[b->noun]);
     if (gst != PIN_CONFIG_SUCCESS) return gst;
-    for (int i = 0; i < (int)sizeof(b->reserved2); i++)
-        if (b->reserved2[i] != 0) return CS_STATUS_INVALID_VALUE;
+    if (b->reserved2 != 0) return CS_STATUS_INVALID_VALUE;
+    // The extras byte belongs to the aux containers; every other type
+    // writes 0, so a pre-v18 config stays valid unchanged.
+    if (b->extras != 0 && !cs_type_is_aux(b->type)) return CS_STATUS_INVALID_VALUE;
 
-    // Brightness ceiling: PWM LEDs only, percent 1-100 with 0 = full.  Every
-    // other type must carry 0, so a pre-v12 config stays valid unchanged.
+    // Brightness ceiling: PWM outputs only, percent 1-100 with 0 = full.
+    // Every other type must carry 0, so a pre-v12 config stays valid unchanged.
     if (b->base_bright > 100) return CS_STATUS_INVALID_VALUE;
-    if (b->base_bright != 0 && b->type != CS_TYPE_LED_PWM)
+    if (b->base_bright != 0 && !cs_type_is_pwm(b->type))
         return CS_STATUS_INVALID_VALUE;
 
-    // Delays filter a boolean indicator condition; everything else (inputs,
-    // IND_LEVEL, the IR container) must carry 0.
+    // Delays filter a boolean indicator condition or an aux output's on/off
+    // flag; everything else (inputs, IND_LEVEL, the IR container) carries 0.
     if ((b->on_delay != 0 || b->off_delay != 0) &&
+        !cs_type_is_aux(b->type) &&
         !((b->type == CS_TYPE_LED || b->type == CS_TYPE_LED_PWM) &&
           (b->action == CS_ACT_IND_EQUALS || b->action == CS_ACT_IND_ABOVE)))
         return CS_STATUS_INVALID_VALUE;
@@ -1604,6 +1714,9 @@ static uint8_t cs_validate(const CsBinding *b, uint8_t slot) {
         if (st != PIN_CONFIG_SUCCESS) return st;
     } else if (b->type == CS_TYPE_DISPLAY) {
         uint8_t st = cs_validate_display_container(b, slot);
+        if (st != PIN_CONFIG_SUCCESS) return st;
+    } else if (cs_type_is_aux(b->type)) {
+        uint8_t st = cs_validate_aux_container(b);
         if (st != PIN_CONFIG_SUCCESS) return st;
     } else {
         uint16_t bit = CS_ACT_BIT(b->action);
@@ -1631,6 +1744,10 @@ static uint8_t cs_validate(const CsBinding *b, uint8_t slot) {
         uint8_t tst = cs_binding_grouped(b) ? cs_validate_group_ref(b)
                                             : cs_noun_validate_target(b);
         if (tst != PIN_CONFIG_SUCCESS) return tst;
+        // A control cannot target the slot it is about to occupy: the aux
+        // it sees there is the binding this one replaces.
+        if (nd->target_kind == CS_TARGET_AUX && !cs_binding_grouped(b) && b->target == slot)
+            return CS_STATUS_INVALID_TARGET;
 
         uint8_t vst = cs_validate_values(b, nd);
         if (vst != PIN_CONFIG_SUCCESS) return vst;
@@ -1662,15 +1779,15 @@ static uint8_t cs_validate(const CsBinding *b, uint8_t slot) {
         }
     }
 
-    // PWM LEDs on different GPIOs can still land on the same PWM slice
+    // PWM outputs on different GPIOs can still land on the same PWM slice
     // output (e.g. GPIO 0 and 16 are both slice 0 channel A on RP2040).
-    if (b->type == CS_TYPE_LED_PWM) {
+    if (cs_type_is_pwm(b->type)) {
         uint slice = pwm_gpio_to_slice_num(b->gpio[0]);
         uint chan  = pwm_gpio_to_channel(b->gpio[0]);
         for (uint8_t s = 0; s < CS_MAX_BINDINGS; s++) {
             if (s == slot || !s_rt[s].active) continue;
             const CsBinding *o = &s_cfg.bindings[s];
-            if (o->type == CS_TYPE_LED_PWM &&
+            if (cs_type_is_pwm(o->type) &&
                 pwm_gpio_to_slice_num(o->gpio[0]) == slice &&
                 pwm_gpio_to_channel(o->gpio[0]) == chan)
                 return CS_STATUS_PWM_CONFLICT;
@@ -2187,6 +2304,48 @@ bool control_surfaces_owns_pin(uint8_t pin) {
     return false;
 }
 
+// Re-check everything addressing aux slot `slot` after its type changed:
+// the on/off noun needs an aux output there, the level noun a PWM one.
+// Same down / resurrect rule as a group edit.
+static void cs_revalidate_aux_dependents(uint8_t slot) {
+    for (uint8_t s = 0; s < CS_MAX_BINDINGS; s++) {
+        const CsBinding *b = &s_cfg.bindings[s];
+        if (s == slot) continue;
+        if (b->type == CS_TYPE_NONE || b->type == CS_TYPE_IR ||
+            b->type == CS_TYPE_DISPLAY || cs_type_is_aux(b->type))
+            continue;
+        if ((b->noun != CS_NOUN_AUX && b->noun != CS_NOUN_AUX_LEVEL) ||
+            cs_binding_grouped(b) || b->target != slot)
+            continue;
+        if (s_rt[s].active) {
+            // Its pins cannot have changed validity; only the target has.
+            uint8_t st = cs_noun_validate_target(b);
+            if (st == PIN_CONFIG_SUCCESS) continue;
+            cs_momentary_release(b, &s_rt[s].op);
+            s_rt[s].active = false;
+            cs_release_pins(s, b);
+            s_slot_status[s] = st;
+            continue;
+        }
+        uint8_t st = cs_validate(b, s);
+        if (st == PIN_CONFIG_SUCCESS) {
+            cs_claim_pins(s);
+            cs_seed_runtime(s);
+        }
+        s_slot_status[s] = st;
+    }
+    for (uint8_t sub = 0; sub < CS_MAX_IR_COMMANDS; sub++) {
+        const IrCommand *c = &s_ir.cmds[sub];
+        if (c->protocol == CS_IR_PROTO_NONE) continue;
+        if ((c->noun != CS_NOUN_AUX && c->noun != CS_NOUN_AUX_LEVEL) ||
+            (c->flags & CS_FLAG_GROUP) || c->target != slot)
+            continue;
+        cs_ir_release_momentary(sub);
+        s_ir_cmd_status[sub] = cs_validate_ir_cmd(c);
+    }
+    cs_macro_recount_status();
+}
+
 uint8_t control_surfaces_apply_binding(uint8_t slot, const CsBinding *nb) {
     if (slot >= CS_MAX_BINDINGS || !nb) return CS_STATUS_INVALID_SLOT;
 
@@ -2196,6 +2355,12 @@ uint8_t control_surfaces_apply_binding(uint8_t slot, const CsBinding *nb) {
     // rebind mid-hold cannot leave the parameter stuck at the held value.
     CsBinding old = s_cfg.bindings[slot];
     bool was_active = s_rt[slot].active;
+    // A live aux slot keeps its value across a same-type re-apply AND a
+    // rejected edit of any type (the restored old binding is seeded from
+    // the carry, so the relay never drops on an error).
+    if (was_active && cs_type_is_aux(old.type))
+        s_aux_carry[slot] = (CsAuxCarry){ old.type, s_rt[slot].aux_on,
+                                          s_rt[slot].aux_level };
     if (was_active) {
         if (cs_binding_grouped(&old)) cs_group_momentary_release(&old, &s_gop[slot]);
         else                          cs_momentary_release(&old, &s_rt[slot].op);
@@ -2224,7 +2389,12 @@ uint8_t control_surfaces_apply_binding(uint8_t slot, const CsBinding *nb) {
         cs_claim_pins(slot);
         cs_seed_runtime(slot);
     }
+    s_aux_carry[slot].type = CS_TYPE_NONE;   // an aux seed consumed it; a non-aux must not inherit it
     s_slot_status[slot] = PIN_CONFIG_SUCCESS;
+    // An aux slot that appeared, vanished or changed kind moves the validity
+    // of every control pointing at it.
+    if (old.type != nb->type && (cs_type_is_aux(old.type) || cs_type_is_aux(nb->type)))
+        cs_revalidate_aux_dependents(slot);
     cs_recount_active();
     cs_rebuild_groups();
     return PIN_CONFIG_SUCCESS;
@@ -2238,13 +2408,17 @@ uint8_t control_surfaces_apply_binding(uint8_t slot, const CsBinding *nb) {
 // The 388-byte CsFlashConfig and 260-byte CsIrConfig snapshots are kept in
 // separate noinline frames: merged, they would sit on the 2 KB main stack at
 // once, above whatever depth the apply path below them needs.
-static void __attribute__((noinline)) cs_load_stored_bindings(void) {
+// Called twice: aux_pass brings up only the aux output slots, the second
+// call everything else, so bindings AND display pages that target an aux
+// slot validate against its type whatever the slot order.
+static void __attribute__((noinline)) cs_load_stored_bindings(bool aux_pass) {
     CsFlashConfig stored;
     preset_get_cs_config(&stored);
     if (stored.version > CS_CONFIG_VERSION) return;   // future format stays idle
     for (uint8_t slot = 0; slot < CS_MAX_BINDINGS; slot++) {
         const CsBinding *b = &stored.bindings[slot];
         if (b->type == CS_TYPE_NONE) continue;
+        if (cs_type_is_aux(b->type) != aux_pass) continue;
         uint8_t st = control_surfaces_apply_binding(slot, b);
         if (st != PIN_CONFIG_SUCCESS) {
             s_cfg.bindings[slot] = *b;
@@ -2294,44 +2468,20 @@ static void cs_load_stored_groups_macros(void) {
     cs_macro_recount_status();
 }
 
-static uint8_t cs_validate_aux_cfg(const CsAuxCfg *c) {
-    if (c->boot_mode > CS_AUX_BOOT_SAVED || c->boot_state > 1 ||
-        c->boot_level > 100 || c->reserved != 0)
-        return CS_STATUS_INVALID_VALUE;
-    return PIN_CONFIG_SUCCESS;
-}
-
-static void cs_reset_aux(void) {
-    memset(&s_aux, 0, sizeof(s_aux));
-    s_aux.version = CS_AUX_CONFIG_VERSION;
-}
-
-// apply_boot is true only at boot: state / level are runtime values, so a
-// revert reloads the cfg without disturbing a live relay or lamp.
-static void cs_load_stored_aux(bool apply_boot) {
-    preset_get_cs_aux(&s_aux);
-    if (s_aux.version > CS_AUX_CONFIG_VERSION) cs_reset_aux();   // future format stays idle
-    for (uint8_t i = 0; i < CS_MAX_AUX; i++) {
-        CsAuxCfg *c = &s_aux.aux[i];
-        c->name[CS_NAME_LEN - 1] = '\0';
-        if (cs_validate_aux_cfg(c) != PIN_CONFIG_SUCCESS) memset(c, 0, sizeof(*c));
-        if (apply_boot) {
-            s_aux_state[i] = c->boot_state;
-            s_aux_level[i] = c->boot_level;
-        }
-    }
-    s_aux.version = CS_AUX_CONFIG_VERSION;
-}
-
 static void cs_load_stored(void) {
     cs_load_stored_groups_macros();
-    // Display pages load before bindings so a stored display binding's
-    // attach sees its stored pages (seeding only fires on an empty table).
+    // Aux slots first (pages and controls validate against them), then the
+    // display pages, which must precede the display binding's attach
+    // (seeding only fires on an empty table), then everything else.
+    cs_load_stored_bindings(true);
     cs_display_load_stored();
-    cs_load_stored_bindings();
+    cs_load_stored_bindings(false);
     cs_load_stored_ir();
     for (uint8_t slot = 0; slot < CS_MAX_BINDINGS; slot++)
         preset_get_cs_name(slot, s_names[slot]);
+    // Macro steps on aux nouns were counted invalid before the aux slots
+    // existed; a failed aux apply never triggers the dependents recount.
+    cs_macro_recount_status();
 }
 
 // Shared group/macro/display state reset for init and revert: sequencer
@@ -2363,11 +2513,19 @@ void control_surfaces_init(void) {
     s_ir_slot = 0xFF;
     s_ir_hold = false;
     cs_reset_groups_macros();
-    cs_load_stored_aux(true);
+    memset(s_aux_carry, 0, sizeof(s_aux_carry));
     cs_load_stored();
 }
 
 void control_surfaces_revert(void) {
+    // Live aux values survive a revert: stash them, and cs_seed_runtime
+    // hands each back to the slot that reloads with the same type.
+    for (uint8_t s = 0; s < CS_MAX_BINDINGS; s++) {
+        const CsBinding *b = &s_cfg.bindings[s];
+        if (s_rt[s].active && cs_type_is_aux(b->type))
+            s_aux_carry[s] = (CsAuxCarry){ b->type, s_rt[s].aux_on,
+                                           s_rt[s].aux_level };
+    }
     // Tear down every live binding through the normal path so pins, the PWM
     // slices and the IR receiver release cleanly, then reload from flash.
     CsBinding none;
@@ -2381,8 +2539,8 @@ void control_surfaces_revert(void) {
     memset(s_ir_op, 0, sizeof(s_ir_op));
     memset(s_ir_cmd_status, 0, sizeof(s_ir_cmd_status));
     cs_reset_groups_macros();
-    cs_load_stored_aux(false);
     cs_load_stored();
+    memset(s_aux_carry, 0, sizeof(s_aux_carry));   // drop stashes no slot reclaimed
 }
 
 void control_surfaces_tick(void) {
@@ -2521,6 +2679,10 @@ void control_surfaces_tick(void) {
             case CS_TYPE_LED_PWM:
                 if (((s_tick_ct + s) & (CS_IND_DECIM - 1)) == 0) cs_tick_led_pwm(s);
                 break;
+            case CS_TYPE_AUX_OUT:
+            case CS_TYPE_AUX_PWM:
+                if (((s_tick_ct + s) & (CS_IND_DECIM - 1)) == 0) cs_tick_aux(s);
+                break;
             case CS_TYPE_POT:
                 if (!pot_done) { cs_tick_pot(s); s_pot_rr = s; pot_done = true; }
                 break;
@@ -2582,47 +2744,55 @@ void control_surfaces_get_ext_status(CsExtStatusPacket *out) {
 // Aux outputs (caps v17)
 // ---------------------------------------------------------------------------
 
-uint8_t control_surfaces_apply_aux_cfg(uint8_t idx, const CsAuxCfg *c) {
-    if (idx >= CS_MAX_AUX || !c) return CS_STATUS_INVALID_AUX;
-    uint8_t st = cs_validate_aux_cfg(c);
-    if (st != PIN_CONFIG_SUCCESS) return st;   // stored record kept intact
-    s_aux.aux[idx] = *c;
-    s_aux.aux[idx].name[CS_NAME_LEN - 1] = '\0';
-    return PIN_CONFIG_SUCCESS;
+uint8_t control_surfaces_slot_type(uint8_t slot) {
+    return (slot < CS_MAX_BINDINGS) ? s_cfg.bindings[slot].type : CS_TYPE_NONE;
 }
 
-const CsAuxConfig *control_surfaces_aux_config(void) { return &s_aux; }
-
-const CsAuxCfg *control_surfaces_get_aux_cfg(uint8_t idx) {
-    return (idx < CS_MAX_AUX) ? &s_aux.aux[idx] : NULL;
+bool control_surfaces_slot_is_aux(uint8_t slot) {
+    return cs_type_is_aux(control_surfaces_slot_type(slot));
 }
 
-uint8_t control_surfaces_aux_state(uint8_t idx) {
-    return (idx < CS_MAX_AUX) ? s_aux_state[idx] : 0;
+// Live values exist only while the output is up: a slot held down by a pin
+// conflict reads 0 and refuses writes, since a value set now would be lost
+// to the boot fields when it comes back.
+static inline bool cs_aux_live(uint8_t slot) {
+    return control_surfaces_slot_is_aux(slot) && s_rt[slot].active;
 }
 
-uint8_t control_surfaces_aux_level(uint8_t idx) {
-    return (idx < CS_MAX_AUX) ? s_aux_level[idx] : 0;
+bool control_surfaces_aux_up(uint8_t slot) { return cs_aux_live(slot); }
+
+uint8_t control_surfaces_aux_state(uint8_t slot) {
+    return cs_aux_live(slot) ? s_rt[slot].aux_on : 0;
 }
 
-bool control_surfaces_set_aux_state(uint8_t idx, uint8_t state) {
-    if (idx >= CS_MAX_AUX) return false;
-    s_aux_state[idx] = state ? 1 : 0;
+uint16_t control_surfaces_aux_level(uint8_t slot) {
+    return (cs_aux_live(slot) && s_cfg.bindings[slot].type == CS_TYPE_AUX_PWM)
+         ? s_rt[slot].aux_level : 0;
+}
+
+bool control_surfaces_set_aux_state(uint8_t slot, uint8_t state) {
+    if (!cs_aux_live(slot)) return false;
+    s_rt[slot].aux_on = state ? 1 : 0;
     return true;
 }
 
-bool control_surfaces_set_aux_level(uint8_t idx, uint8_t level) {
-    if (idx >= CS_MAX_AUX) return false;
-    s_aux_level[idx] = (level > 100) ? 100 : level;
+bool control_surfaces_set_aux_level(uint8_t slot, uint16_t level_q8) {
+    if (!cs_aux_live(slot) || s_cfg.bindings[slot].type != CS_TYPE_AUX_PWM) return false;
+    uint16_t max = (uint16_t)cs_noun_table[CS_NOUN_AUX_LEVEL].max_q;
+    s_rt[slot].aux_level = (level_q8 > max) ? max : level_q8;
     return true;
 }
 
 void control_surfaces_aux_prepare_save(void) {
-    for (uint8_t i = 0; i < CS_MAX_AUX; i++) {
-        CsAuxCfg *c = &s_aux.aux[i];
-        if (c->boot_mode != CS_AUX_BOOT_SAVED) continue;
-        c->boot_state = s_aux_state[i];
-        c->boot_level = s_aux_level[i];
+    for (uint8_t s = 0; s < CS_MAX_BINDINGS; s++) {
+        CsBinding *b = &s_cfg.bindings[s];
+        // A down output has no live value worth keeping over its boot fields.
+        if (!s_rt[s].active || !cs_type_is_aux(b->type) ||
+            !(b->extras & CS_AUX_X_BOOT_SAVED))
+            continue;
+        if (s_rt[s].aux_on) b->extras |= CS_AUX_X_BOOT_ON;
+        else                b->extras &= (uint8_t)~CS_AUX_X_BOOT_ON;
+        if (b->type == CS_TYPE_AUX_PWM) b->value = (int16_t)s_rt[s].aux_level;
     }
 }
 

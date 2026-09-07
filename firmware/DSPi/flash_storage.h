@@ -134,15 +134,10 @@ void preset_get_cs_macros(CsMacroConfig *out);
 // preset_set_cs_all below.
 void preset_get_cs_display(CsDisplayFlash *out);
 
-// Control Surfaces auxiliary output table (board-level, directory-stored,
-// V20+).  Getter copies out of the RAM cache; persists only through
-// preset_set_cs_all below.
-void preset_get_cs_aux(CsAuxConfig *out);
-
 uint8_t preset_set_cs_all(const CsFlashConfig *cfg, const CsIrConfig *ir,
                           const char (*names)[CS_NAME_LEN],
                           const CsGroupConfig *groups, const CsMacroConfig *macros,
-                          const CsDisplayFlash *display, const CsAuxConfig *aux);
+                          const CsDisplayFlash *display);
 
 // Control Surfaces slot names (board-level, directory-stored, V10+).  User
 // labels for what each control slot is for; independent of the bindings

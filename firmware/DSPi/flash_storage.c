@@ -605,10 +605,10 @@ typedef struct __attribute__((packed)) {
 // seeded on first display apply, not at migration, so a migrated device shows
 // nothing until configured.  V17-style prefix copy again.
 //
-// V20 appends the Control Surfaces auxiliary output table (CsAuxConfig: 8 aux
-// records), board-level beside cs_config.  All-zero = every output off and
-// unnamed, so a fresh or migrated directory needs no seeding.  V17-style prefix
-// copy again.
+// V20 appended a 292-byte auxiliary output table; V21 drops it again, because
+// auxiliary outputs became binding-slot components rather than a separate
+// table.  V21 is therefore byte-identical to V19, and a V20 directory migrates
+// by a prefix copy that stops before the dropped block.
 typedef struct __attribute__((packed)) {
     uint32_t magic;                          // DIR_MAGIC
     uint16_t version;                        // Directory format version (4)
@@ -670,10 +670,6 @@ typedef struct __attribute__((packed)) {
     // V19 addition: Control Surfaces display config and page table.  Board-level
     // like cs_config; all-zero = feature idle, no pages configured.
     CsDisplayFlash cs_display;               // 80 bytes
-
-    // V20 addition: Control Surfaces auxiliary outputs.  Board-level like
-    // cs_config; all-zero = every output off, unnamed and boot-fixed.
-    CsAuxConfig cs_aux;                      // 292 bytes
 } PresetDirectory;
 
 // Historical directory layout at V4, where output_config was the 20-byte
@@ -1069,10 +1065,9 @@ typedef struct __attribute__((packed)) {
 } PresetDirectory_v18;
 
 // --- Preset Directory v19 (kept only for upgrade migration) ---
-// Identical to the live layout except it lacks the trailing cs_aux block.
-// The embedded types are still the live ones only because nothing has grown
-// them since V19; the size assert below pins that, and growing any of them
-// means snapshotting a _v19 variant here first.
+// Identical to the live V21 layout.  The embedded types are still the live ones
+// only because nothing has grown them since V19; the size assert below pins
+// that, and growing any of them means snapshotting a _v19 variant here first.
 typedef struct __attribute__((packed)) {
     uint32_t magic;
     uint16_t version;                        // == 19
@@ -1100,6 +1095,38 @@ typedef struct __attribute__((packed)) {
     CsDisplayFlash cs_display;               // 80 bytes
 } PresetDirectory_v19;
 
+// --- Preset Directory v20 (kept only for upgrade migration) ---
+// The V19 layout plus the auxiliary output table V21 dropped.  The block is
+// opaque here because the CsAuxConfig type is gone; the migration copies the
+// prefix ahead of it and discards it.
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint16_t version;                        // == 20
+    uint16_t reserved;
+    uint32_t crc32;
+
+    uint8_t  startup_mode;
+    uint8_t  default_slot;
+    uint8_t  last_active_slot;
+    uint8_t  output_config_mode;
+    uint16_t slot_occupied;
+    uint8_t  master_volume_mode;
+    uint8_t  spdif_rx_pin;
+    float    master_volume_db;
+    char     slot_names[PRESET_SLOTS][PRESET_NAME_LEN];
+    DacHwMuteConfig dac_hw_mute;
+    FlashOutputConfig output_config;         // 35 bytes (current layout)
+    UartCtrlConfig uart_ctrl;
+    I2cCtrlConfig  i2c_ctrl;
+    CsFlashConfig cs_config;                 // 388 bytes (current format v2)
+    char cs_names[CS_MAX_BINDINGS][CS_NAME_LEN];  // 512 bytes
+    CsIrConfig cs_ir;                        // 260 bytes (current format v2)
+    CsGroupConfig cs_groups;                 // 324 bytes
+    CsMacroConfig cs_macros;                 // 1060 bytes
+    CsDisplayFlash cs_display;               // 80 bytes
+    uint8_t cs_aux[292];                     // dropped by V21
+} PresetDirectory_v20;
+
 // The V16->V17 migration copies everything ahead of cs_ir with one memcpy, so
 // the two layouts must agree byte-for-byte up to that point.
 _Static_assert(offsetof(PresetDirectory_v16, cs_ir) == offsetof(PresetDirectory, cs_ir),
@@ -1125,15 +1152,23 @@ _Static_assert(offsetof(PresetDirectory_v18, cs_macros) == offsetof(PresetDirect
 _Static_assert(sizeof(PresetDirectory_v18) == 2955,
                "V18 directory geometry is frozen; snapshot any struct that grew");
 
-// V20 only appends, so the V19->V20 migration copies the whole V19 data block
-// as one prefix; cs_display must therefore still start at the same offset.
+// V21 restores the V19 layout, so the V19->V21 migration copies the whole V19
+// data block; the two must stay byte-identical, which the size check pins.
 _Static_assert(offsetof(PresetDirectory_v19, cs_display) == offsetof(PresetDirectory, cs_display),
-               "V19 and V20 directories must share a byte-identical pre-cs_aux prefix");
+               "V19 and V21 directories must share a byte-identical layout");
 // Pins the on-flash V19 geometry, which the offset check above cannot.
 _Static_assert(sizeof(PresetDirectory_v19) == 3035,
                "V19 directory geometry is frozen; snapshot any struct that grew");
 
-#define DIR_VERSION_CURRENT  20
+// V20 only differs by the trailing aux table, so the V20->V21 migration is a
+// prefix copy that stops at cs_aux; everything ahead of it must match V21.
+_Static_assert(offsetof(PresetDirectory_v20, cs_display) == offsetof(PresetDirectory, cs_display),
+               "V20 and V21 directories must share a byte-identical pre-cs_aux prefix");
+// Pins the on-flash V20 geometry, which the offset check above cannot.
+_Static_assert(sizeof(PresetDirectory_v20) == 3327,
+               "V20 directory geometry is frozen; snapshot any struct that grew");
+
+#define DIR_VERSION_CURRENT  21
 
 // The directory occupies exactly one flash sector; growth past it would
 // silently overrun into preset slot 0.
@@ -1449,7 +1484,6 @@ static void dir_sanitize_cs_ir(void);                                 // defined
 static void dir_sanitize_cs_groups(void);                             // defined below
 static void dir_sanitize_cs_macros(void);                             // defined below
 static void dir_sanitize_cs_display(void);                            // defined below
-static void dir_sanitize_cs_aux(void);                                // defined below
 static void cs_config_from_v1(CsFlashConfig *dst, const CsFlashConfig_v1 *src);  // defined below
 static void cs_ir_from_v1(CsIrConfig *dst, const CsIrConfig_v1 *src);            // defined below
 // Forward declaration — defined alongside validate_slot() in the SLOT
@@ -1725,15 +1759,40 @@ static bool dir_load_cache(void) {
         dir_sanitize_cs_groups();
         dir_sanitize_cs_macros();
         dir_sanitize_cs_display();
-        dir_sanitize_cs_aux();
         dir_cache_valid = true;
         return true;
     }
 
+    if (flash_dir->version == 20) {
+        // V20 -> V21 migration.  V21 drops the trailing aux output table, so
+        // copy the V20 data block up to it and discard the rest; any aux output
+        // configured on a V20 build is gone and must be rebuilt as a binding.
+        const PresetDirectory_v20 *v20 = (const PresetDirectory_v20 *)flash_dir;
+        const uint8_t *v20_data_start = (const uint8_t *)&v20->startup_mode;
+        size_t v20_data_len = sizeof(PresetDirectory_v20) - offsetof(PresetDirectory_v20, startup_mode);
+        if (crc32(v20_data_start, v20_data_len) != v20->crc32) {
+            dir_cache_valid = false;
+            return false;
+        }
+        memset(&dir_cache, 0, sizeof(dir_cache));
+        // Header excluded: dir_flush() restamps magic/version/crc, and copying
+        // the old one would leave the cache reading V20 until it does.
+        memcpy(&dir_cache.startup_mode, v20_data_start,
+               offsetof(PresetDirectory_v20, cs_aux) - offsetof(PresetDirectory_v20, startup_mode));
+        dir_sanitize_ctrl_iface();
+        dir_sanitize_cs_config();
+        dir_sanitize_cs_ir();
+        dir_sanitize_cs_groups();
+        dir_sanitize_cs_macros();
+        dir_sanitize_cs_display();
+        dir_cache_valid = true;
+        (void)dir_flush();   // persist at the current version
+        return true;
+    }
+
     if (flash_dir->version == 19) {
-        // V19 -> V20 migration.  V20 appends the Control Surfaces aux output
-        // table; everything before it is byte-identical, so copy the whole V19
-        // data block and leave the new blob zeroed (every output off, unnamed).
+        // V19 -> V21 migration.  V21 restored the V19 layout, so the whole V19
+        // data block copies across unchanged.
         const PresetDirectory_v19 *v19 = (const PresetDirectory_v19 *)flash_dir;
         const uint8_t *v19_data_start = (const uint8_t *)&v19->startup_mode;
         size_t v19_data_len = sizeof(PresetDirectory_v19) - offsetof(PresetDirectory_v19, startup_mode);
@@ -1751,7 +1810,6 @@ static bool dir_load_cache(void) {
         dir_sanitize_cs_groups();
         dir_sanitize_cs_macros();
         dir_sanitize_cs_display();
-        dir_sanitize_cs_aux();
         dir_cache_valid = true;
         (void)dir_flush();   // persist at the current version
         return true;
@@ -1778,7 +1836,6 @@ static bool dir_load_cache(void) {
         dir_sanitize_cs_groups();
         dir_sanitize_cs_macros();
         dir_sanitize_cs_display();
-        dir_sanitize_cs_aux();
         dir_cache_valid = true;
         (void)dir_flush();   // persist at the current version
         return true;
@@ -1806,7 +1863,6 @@ static bool dir_load_cache(void) {
         dir_sanitize_cs_groups();
         dir_sanitize_cs_macros();
         dir_sanitize_cs_display();
-        dir_sanitize_cs_aux();
         dir_cache_valid = true;
         (void)dir_flush();   // persist at the current version
         return true;
@@ -1837,7 +1893,6 @@ static bool dir_load_cache(void) {
         dir_sanitize_cs_groups();
         dir_sanitize_cs_macros();
         dir_sanitize_cs_display();
-        dir_sanitize_cs_aux();
         dir_cache_valid = true;
         (void)dir_flush();   // persist at the current version
         return true;
@@ -1879,7 +1934,6 @@ static bool dir_load_cache(void) {
         dir_sanitize_cs_groups();
         dir_sanitize_cs_macros();
         dir_sanitize_cs_display();
-        dir_sanitize_cs_aux();
         dir_cache_valid = true;
         (void)dir_flush();   // persist at the current version
         return true;
@@ -1923,7 +1977,6 @@ static bool dir_load_cache(void) {
         dir_sanitize_cs_groups();
         dir_sanitize_cs_macros();
         dir_sanitize_cs_display();
-        dir_sanitize_cs_aux();
         dir_cache_valid = true;
         (void)dir_flush();   // persist at the current version
         return true;
@@ -1966,7 +2019,6 @@ static bool dir_load_cache(void) {
         dir_sanitize_cs_groups();
         dir_sanitize_cs_macros();
         dir_sanitize_cs_display();
-        dir_sanitize_cs_aux();
         dir_cache_valid = true;
         (void)dir_flush();   // persist at the current version
         return true;
@@ -2010,7 +2062,6 @@ static bool dir_load_cache(void) {
         dir_sanitize_cs_groups();
         dir_sanitize_cs_macros();
         dir_sanitize_cs_display();
-        dir_sanitize_cs_aux();
         dir_cache_valid = true;
         (void)dir_flush();   // persist at the current version
         return true;
@@ -2053,7 +2104,6 @@ static bool dir_load_cache(void) {
         dir_sanitize_cs_groups();
         dir_sanitize_cs_macros();
         dir_sanitize_cs_display();
-        dir_sanitize_cs_aux();
         dir_cache_valid = true;
         (void)dir_flush();   // persist at the current version
         return true;
@@ -2096,7 +2146,6 @@ static bool dir_load_cache(void) {
         dir_sanitize_cs_groups();
         dir_sanitize_cs_macros();
         dir_sanitize_cs_display();
-        dir_sanitize_cs_aux();
         dir_cache_valid = true;
         (void)dir_flush();   // persist at the current version
         return true;
@@ -2137,7 +2186,6 @@ static bool dir_load_cache(void) {
         dir_sanitize_cs_groups();
         dir_sanitize_cs_macros();
         dir_sanitize_cs_display();
-        dir_sanitize_cs_aux();
         dir_cache_valid = true;
         (void)dir_flush();   // persist at the current version
         return true;
@@ -2505,7 +2553,7 @@ static void cs_config_from_v1(CsFlashConfig *dst, const CsFlashConfig_v1 *src) {
         n->step      = o->step;
         n->range_min = o->range_min;
         n->range_max = o->range_max;
-        // event / target / index / reserved / delays / reserved2 stay zero.
+        // event / target / index / reserved / delays / extras / reserved2 stay zero.
     }
     // slots 8..15 stay zero (CS_TYPE_NONE) from the memset.
 }
@@ -2659,33 +2707,6 @@ static void dir_sanitize_cs_display(void) {
     // Normalize the version byte; a fresh/migrated all-zero block leaves it 0
     // (still idle, every page empty).
     c->version = CS_DISPLAY_CONFIG_VERSION;
-}
-
-// Bound-check the directory's Control Surfaces aux output table.  An implausible
-// blob version (or a dirty reserved field) resets the whole block; a record with
-// an out-of-range boot mode, state or level is cleared to the safe default (off,
-// unnamed).  Mirrors dir_sanitize_cs_display.
-static void dir_sanitize_cs_aux(void) {
-    CsAuxConfig *c = &dir_cache.cs_aux;
-    if (c->version > CS_AUX_CONFIG_VERSION ||
-        c->reserved[0] || c->reserved[1] || c->reserved[2]) {
-        memset(c, 0, sizeof(*c));
-        c->version = CS_AUX_CONFIG_VERSION;
-        return;
-    }
-    for (int a = 0; a < CS_MAX_AUX; a++) {
-        CsAuxCfg *aux = &c->aux[a];
-        if (aux->boot_mode > CS_AUX_BOOT_SAVED || aux->boot_state > 1 ||
-            aux->boot_level > 100 || aux->reserved) {
-            memset(aux, 0, sizeof(*aux));
-        }
-        // Guarantee NUL termination so hand-edited flash can never leak an
-        // unterminated string to REQ_GET_CS_AUX_CFG readers.
-        aux->name[CS_NAME_LEN - 1] = '\0';
-    }
-    // Normalize the version byte; a fresh/migrated all-zero block leaves it 0
-    // (still idle, every output off).
-    c->version = CS_AUX_CONFIG_VERSION;
 }
 
 // Write the RAM-cached directory back to flash.
@@ -4321,19 +4342,11 @@ void preset_get_cs_display(CsDisplayFlash *out) {
     memcpy(out, &dir_cache.cs_display, sizeof(*out));
 }
 
-// Control Surfaces auxiliary outputs (V20).  Getter reads the RAM cache;
-// persists through preset_set_cs_all below.
-void preset_get_cs_aux(CsAuxConfig *out) {
-    if (!out) return;
-    dir_ensure();
-    memcpy(out, &dir_cache.cs_aux, sizeof(*out));
-}
-
 uint8_t preset_set_cs_all(const CsFlashConfig *cfg, const CsIrConfig *ir,
                           const char (*names)[CS_NAME_LEN],
                           const CsGroupConfig *groups, const CsMacroConfig *macros,
-                          const CsDisplayFlash *display, const CsAuxConfig *aux) {
-    if (!cfg || !ir || !names || !groups || !macros || !display || !aux) return PRESET_ERR_INVALID_SLOT;
+                          const CsDisplayFlash *display) {
+    if (!cfg || !ir || !names || !groups || !macros || !display) return PRESET_ERR_INVALID_SLOT;
     dir_ensure();
     memcpy(&dir_cache.cs_config, cfg, sizeof(dir_cache.cs_config));
     dir_cache.cs_config.version = CS_CONFIG_VERSION;
@@ -4345,8 +4358,6 @@ uint8_t preset_set_cs_all(const CsFlashConfig *cfg, const CsIrConfig *ir,
     dir_cache.cs_macros.version = CS_MACRO_CONFIG_VERSION;
     memcpy(&dir_cache.cs_display, display, sizeof(dir_cache.cs_display));
     dir_cache.cs_display.version = CS_DISPLAY_CONFIG_VERSION;
-    memcpy(&dir_cache.cs_aux, aux, sizeof(dir_cache.cs_aux));
-    dir_cache.cs_aux.version = CS_AUX_CONFIG_VERSION;
     memcpy(dir_cache.cs_names, names, sizeof(dir_cache.cs_names));
     for (uint8_t s = 0; s < CS_MAX_BINDINGS; s++)
         dir_cache.cs_names[s][CS_NAME_LEN - 1] = '\0';
@@ -4354,8 +4365,6 @@ uint8_t preset_set_cs_all(const CsFlashConfig *cfg, const CsIrConfig *ir,
         dir_cache.cs_groups.groups[g].name[CS_NAME_LEN - 1] = '\0';
     for (uint8_t m = 0; m < CS_MAX_MACROS; m++)
         dir_cache.cs_macros.macros[m].name[CS_NAME_LEN - 1] = '\0';
-    for (uint8_t a = 0; a < CS_MAX_AUX; a++)
-        dir_cache.cs_aux.aux[a].name[CS_NAME_LEN - 1] = '\0';
     if (dir_flush() != 0) {
         return PRESET_ERR_FLASH_WRITE;
     }

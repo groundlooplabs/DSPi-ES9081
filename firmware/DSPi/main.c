@@ -2539,35 +2539,16 @@ int main(void) {
                 }
             }
 
-            // Control Surfaces aux cfg SET (deferred).  Name and boot values
-            // only; the runtime state never comes this way.  Aux slots report
-            // as 0x70 | idx.
-            if (cs_set_aux_cfg_pending) {
-                CsAuxCfg c;
-                uint8_t slot;
-                uint32_t f = save_and_disable_interrupts();
-                memcpy(&c, (const void *)&cs_set_aux_cfg_val, sizeof(c));
-                slot = cs_set_aux_cfg_slot;
-                cs_set_aux_cfg_pending = false;
-                restore_interrupts(f);
-                uint8_t status = control_surfaces_apply_aux_cfg(slot, &c);
-                cs_last_status = status;
-                cs_last_slot = 0x70 | (slot & 0x0F);
-                if (status == PIN_CONFIG_SUCCESS) {
-                    control_surfaces_set_dirty(true);
-                }
-            }
-
             // Control Surfaces SAVE (deferred).  Persist the whole live config
             // (bindings + IR commands + slot names + groups + macros + display
-            // config and pages + aux outputs) in one directory flash write,
-            // then clear the dirty preview flag on success.
+            // config and pages) in one directory flash write, then clear the
+            // dirty preview flag on success.
             if (cs_save_pending) {
                 uint32_t f = save_and_disable_interrupts();
                 cs_save_pending = false;
                 restore_interrupts(f);
-                // SAVED-mode aux slots capture their live values now, before
-                // the cfg is copied out.
+                // SAVED-mode aux slots fold their live values into their
+                // binding's boot fields now, before the cfg is copied out.
                 control_surfaces_aux_prepare_save();
                 prepare_flash_write_operation();
                 uint8_t rc = preset_set_cs_all(control_surfaces_config(),
@@ -2575,8 +2556,7 @@ int main(void) {
                                                control_surfaces_names(),
                                                control_surfaces_group_config(),
                                                control_surfaces_macro_config(),
-                                               control_surfaces_display_flash(),
-                                               control_surfaces_aux_config());
+                                               control_surfaces_display_flash());
                 complete_flash_write_operation_full();
                 cs_last_status = (rc == PRESET_OK) ? PIN_CONFIG_SUCCESS
                                                    : CS_STATUS_FLASH_ERROR;

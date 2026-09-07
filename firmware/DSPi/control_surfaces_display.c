@@ -788,12 +788,12 @@ static void disp_format_label_ex(const CsDisplayPage *p, char *out, size_t n,
                      p->target + 1, p->index + 1, base);
             break;
         case CS_TARGET_AUX: {
-            // The user's name replaces "Aux N"; the level page keeps a suffix
-            // so both pages of one output stay distinguishable.
-            const CsAuxCfg *c = control_surfaces_get_aux_cfg(p->target);
+            // The aux slot's own name replaces "Aux N" (N = slot + 1); the
+            // level page keeps a suffix so both pages stay distinguishable.
+            const char *nm = control_surfaces_get_name(p->target);
             const char *sfx = (p->noun == CS_NOUN_AUX_LEVEL)
                             ? (tight ? " Lvl" : " Level") : "";
-            if (c && c->name[0]) snprintf(out, n, "%s%s", c->name, sfx);
+            if (nm && nm[0]) snprintf(out, n, "%s%s", nm, sfx);
             else snprintf(out, n, "%s %d%s", base, p->target + 1, sfx);
             break;
         }

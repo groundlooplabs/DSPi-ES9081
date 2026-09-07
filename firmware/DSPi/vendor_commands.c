@@ -1467,55 +1467,48 @@ static bool vendor_handle_set_data(tusb_control_request_t const *req) {
             break;
         }
 
-        case REQ_SET_CS_AUX_CFG: {
-            // Name and boot values only, deferred like the group SET so the
-            // apply and dirty flag stay on the main loop.  Aux slots are
-            // tagged 0x70 | idx in cs_last_slot.
-            uint8_t slot = vendor_last_wValue & 0xFF;
-            if (slot >= CS_MAX_AUX) {
-                cs_last_status = CS_STATUS_INVALID_AUX;
-                cs_last_slot = 0x70 | (slot & 0x0F);
-            } else if (cs_set_aux_cfg_pending) {
-                cs_last_status = CS_STATUS_BUSY;
-                cs_last_slot = 0x70 | (slot & 0x0F);
-            } else if (buffer->data_len >= sizeof(CsAuxCfg)) {
-                memcpy((void *)&cs_set_aux_cfg_val, vendor_rx_buf, sizeof(CsAuxCfg));
-                cs_set_aux_cfg_slot = slot;
-                cs_last_status = CS_STATUS_PENDING;
-                cs_last_slot = 0x70 | (slot & 0x0F);
-                __dmb();
-                cs_set_aux_cfg_pending = true;
-            } else {
-                cs_last_status = CS_STATUS_INVALID_VALUE;
-                cs_last_slot = 0x70 | (slot & 0x0F);
-            }
-            break;
-        }
-
         case REQ_SET_CS_AUX_STATE:
         case REQ_SET_CS_AUX_LEVEL: {
-            // Runtime values: single-byte stores applied here, no flash, no
-            // dirty flag.  The notify carries the dispatch source so a bound
-            // control reads as GPIO and a host write echoes back as HOST_SET.
+            // wValue is an ordinary binding slot holding an aux component.
+            // Applied here, no flash, no dirty flag.  The notify carries the
+            // dispatch source so a bound control reads as GPIO and a host
+            // write echoes back as HOST_SET.
             uint8_t slot = vendor_last_wValue & 0xFF;
-            if (slot >= CS_MAX_AUX || buffer->data_len < 1) {
+            bool is_level = (vendor_last_request == REQ_SET_CS_AUX_LEVEL);
+            if (slot >= CS_MAX_BINDINGS) {
                 cs_last_status = CS_STATUS_INVALID_AUX;
-                cs_last_slot = 0x70 | (slot & 0x0F);
+                cs_last_slot = slot;
                 handled = false;
                 break;
             }
-            uint8_t before = (vendor_last_request == REQ_SET_CS_AUX_STATE)
-                           ? control_surfaces_aux_state(slot)
-                           : control_surfaces_aux_level(slot);
-            if (vendor_last_request == REQ_SET_CS_AUX_STATE)
-                (void)control_surfaces_set_aux_state(slot, vendor_rx_buf[0] ? 1 : 0);
-            else
-                (void)control_surfaces_set_aux_level(slot, vendor_rx_buf[0]);
-            uint8_t st = control_surfaces_aux_state(slot);
-            uint8_t lv = control_surfaces_aux_level(slot);
+            if (buffer->data_len < (is_level ? 2u : 1u)) {
+                cs_last_status = CS_STATUS_INVALID_VALUE;
+                cs_last_slot = slot;
+                handled = false;
+                break;
+            }
+            uint8_t  before_st = control_surfaces_aux_state(slot);
+            uint16_t before_lv = control_surfaces_aux_level(slot);
+            bool ok;
+            if (is_level) {
+                uint16_t v = (uint16_t)vendor_rx_buf[0]
+                           | ((uint16_t)vendor_rx_buf[1] << 8);
+                ok = control_surfaces_set_aux_level(slot, v);
+            } else {
+                ok = control_surfaces_set_aux_state(slot, vendor_rx_buf[0] ? 1 : 0);
+            }
+            if (!ok) {
+                // Wrong component type: level only takes on a PWM aux slot.
+                cs_last_status = CS_STATUS_INVALID_AUX;
+                cs_last_slot = slot;
+                handled = false;
+                break;
+            }
+            uint8_t  st = control_surfaces_aux_state(slot);
+            uint16_t lv = control_surfaces_aux_level(slot);
             // Unchanged writes stay silent, like notify_param_write: a pot
             // quantises at half a percent and would otherwise double the traffic.
-            if (((vendor_last_request == REQ_SET_CS_AUX_STATE) ? st : lv) != before)
+            if (st != before_st || lv != before_lv)
                 notify_push_cs_aux(slot, st, lv, _dispatch_src);
             break;
         }
@@ -2914,36 +2907,37 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
                 return true;
             }
 
-            case REQ_GET_CS_AUX_CFG: {
-                // wValue = aux index; returns the live 36-byte record.
-                if (setup->wValue >= CS_MAX_AUX) return false;
-                const CsAuxCfg *c = control_surfaces_get_aux_cfg((uint8_t)setup->wValue);
-                if (c == NULL) return false;
-                vendor_send_response(c, sizeof(CsAuxCfg));
-                return true;
-            }
-
             case REQ_GET_CS_AUX_STATE: {
-                // wValue = aux index: 1 state byte.  0xFFFF: every state then
-                // every level (16 bytes), one read for a host's initial sync.
+                // wValue = binding slot: 1 state byte.  0xFFFF: 16 state bytes
+                // then 16 little-endian 8.8 levels (48 bytes), one read for a
+                // host's initial sync; slots without an UP aux output read zero.
                 if (setup->wValue == 0xFFFF) {
-                    for (uint8_t i = 0; i < CS_MAX_AUX; i++) {
+                    for (uint8_t i = 0; i < CS_MAX_BINDINGS; i++) {
+                        uint16_t lv = control_surfaces_aux_level(i);
                         resp_buf[i] = control_surfaces_aux_state(i);
-                        resp_buf[CS_MAX_AUX + i] = control_surfaces_aux_level(i);
+                        resp_buf[CS_MAX_BINDINGS + 2 * i]     = (uint8_t)(lv & 0xFF);
+                        resp_buf[CS_MAX_BINDINGS + 2 * i + 1] = (uint8_t)(lv >> 8);
                     }
-                    vendor_send_response(resp_buf, 2 * CS_MAX_AUX);
+                    vendor_send_response(resp_buf, 3 * CS_MAX_BINDINGS);
                     return true;
                 }
-                if (setup->wValue >= CS_MAX_AUX) return false;
+                if (setup->wValue >= CS_MAX_BINDINGS ||
+                    !control_surfaces_aux_up((uint8_t)setup->wValue))
+                    return false;
                 resp_buf[0] = control_surfaces_aux_state((uint8_t)setup->wValue);
                 vendor_send_response(resp_buf, 1);
                 return true;
             }
 
             case REQ_GET_CS_AUX_LEVEL: {
-                if (setup->wValue >= CS_MAX_AUX) return false;
-                resp_buf[0] = control_surfaces_aux_level((uint8_t)setup->wValue);
-                vendor_send_response(resp_buf, 1);
+                // wValue = binding slot; 8.8 percent, zero on an on/off aux.
+                if (setup->wValue >= CS_MAX_BINDINGS ||
+                    !control_surfaces_aux_up((uint8_t)setup->wValue))
+                    return false;
+                uint16_t lv = control_surfaces_aux_level((uint8_t)setup->wValue);
+                resp_buf[0] = (uint8_t)(lv & 0xFF);
+                resp_buf[1] = (uint8_t)(lv >> 8);
+                vendor_send_response(resp_buf, 2);
                 return true;
             }
 

@@ -68,7 +68,7 @@ Bytes 4..N are event-specific. Host MUST size its read by `actual_length`, not b
 | 0x05 | `NOTIFY_EVT_INPUT_FORMAT`     | Discrete     | Active USB/pipeline input channel count changed. Payload: `uint8_t channels` (byte 4). |
 | 0x06 | reserved (coalesceable)      |              | Reserved for batched `PARAM_CHANGED` (see §10.5). |
 | 0x07 | `NOTIFY_EVT_SIGGEN_STATE`     | Discrete     | Test-signal generator start/stop/completion. See §3.8. |
-| 0x0C | `NOTIFY_EVT_CS_AUX`           | Discrete     | Aux output state or level changed. 8-byte packet `[ver=2, 0x0C, flags=0, seq, aux (0-7), state (0/1), level (0-100), src]`. Pushed on every `REQ_SET_CS_AUX_STATE` (0x04) and `REQ_SET_CS_AUX_LEVEL` (0x06), whatever the origin. `src` identifies it: `GPIO` for a bound control, `HOST_SET` for USB, `UART` / `I2C` for those transports. |
+| 0x0C | `NOTIFY_EVT_CS_AUX`           | Discrete     | Aux output state or level changed. 9-byte packet `[ver=2, 0x0C, flags=0, seq, slot (0-15), state (0/1), level_q8 (uint16 LE, 8.8 percent), src]`. `slot` is the Control Surfaces binding slot holding the aux component; `level_q8` reads 0 on a `CS_TYPE_AUX_OUT` slot. Pushed on every `REQ_SET_CS_AUX_STATE` (0x04) and `REQ_SET_CS_AUX_LEVEL` (0x06) that changes a value, whatever the origin. `src` identifies it: `GPIO` for a bound control, `HOST_SET` for USB, `UART` / `I2C` for those transports. See `control_surfaces_aux_spec.md`. |
 | 0x0D..0x7F | reserved (coalesceable) |              | |
 | 0x80..0xFF | reserved (discrete)     |              | |
 

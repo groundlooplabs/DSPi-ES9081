@@ -78,7 +78,8 @@
 // v2 Control Surfaces aux output changed (REQ_SET_CS_AUX_STATE / _LEVEL from
 // any source, including a bound control).  Both values are sent so a host
 // refreshes the slot in one step; src identifies the origin.
-// Packet: [ver=2, evt=0x0C, flags=0, seq, aux, state, level, src]
+// Packet (9 bytes): [ver=2, evt=0x0C, flags=0, seq, slot, state,
+// level_q8_LE(2), src]; level is 8.8 percent, 0 on a CS_TYPE_AUX_OUT slot.
 #define NOTIFY_EVT_CS_AUX            0x0C
 
 // v2 protocol version byte (first byte of every v2 packet)
@@ -160,7 +161,7 @@ void notify_push_adat_input_state(uint8_t state, uint32_t rate_hz,
 void notify_push_cs_ir_learn(uint8_t state, uint8_t protocol, uint32_t code);
 
 // Aux output change (NOTIFY_EVT_CS_AUX).  Safe from any dispatch context.
-void notify_push_cs_aux(uint8_t aux, uint8_t state, uint8_t level, ParamSource src);
+void notify_push_cs_aux(uint8_t slot, uint8_t state, uint16_t level_q8, ParamSource src);
 
 // ---------------------------------------------------------------------------
 // Consumers

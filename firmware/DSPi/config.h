@@ -128,18 +128,20 @@ extern volatile uint32_t nominal_feedback_10_14;
 // tud_vendor_control_xfer_cb in vendor_commands.c.
 #define MS_VENDOR_CODE      0x01
 
-// Control Surfaces auxiliary outputs (caps v17); see control_surfaces.h and
-// Documentation/Features/control_surfaces_aux_spec.md.  0x01 is MS_VENDOR_CODE
-// above, intercepted in tud_vendor_control_xfer_cb before the application
-// dispatcher sees it; 0x00 and 0x08-0x0F stay unallocated.
-#define REQ_SET_CS_AUX_CFG          0x02  // wValue = aux (0-7), payload = 36-byte CsAuxCfg;
-                                          // deferred, live-only preview (REQ_CS_SAVE persists)
-#define REQ_GET_CS_AUX_CFG          0x03  // wValue = aux (0-7); returns 36-byte CsAuxCfg
-#define REQ_SET_CS_AUX_STATE        0x04  // wValue = aux (0-7), 1 byte 0/1; immediate, runtime only
-#define REQ_GET_CS_AUX_STATE        0x05  // wValue = aux (0-7): 1 byte; wValue = 0xFFFF:
-                                          // 16 bytes {state[8], level[8]}
-#define REQ_SET_CS_AUX_LEVEL        0x06  // wValue = aux (0-7), 1 byte 0..100 (clamped)
-#define REQ_GET_CS_AUX_LEVEL        0x07  // wValue = aux (0-7); returns 1 byte
+// Control Surfaces auxiliary outputs (caps v18); see control_surfaces.h and
+// Documentation/Features/control_surfaces_aux_spec.md.  wValue is the binding
+// slot holding the aux component.  0x01 is MS_VENDOR_CODE above, intercepted
+// in tud_vendor_control_xfer_cb before the application dispatcher sees it;
+// 0x00, 0x02 and 0x03 stay unallocated.
+#define REQ_SET_CS_AUX_STATE        0x04  // wValue = slot, 1 byte 0/1; immediate, runtime
+                                          // only; STALL unless the slot is an aux output
+#define REQ_GET_CS_AUX_STATE        0x05  // wValue = slot: 1 byte (STALL if not an aux);
+                                          // wValue = 0xFFFF: 48 bytes {state[16],
+                                          // level_q8[16] LE}, zeros on non-aux slots
+#define REQ_SET_CS_AUX_LEVEL        0x06  // wValue = slot, 2 bytes 8.8 percent LE, clamped
+                                          // to 100 %; STALL unless a CS_TYPE_AUX_PWM slot
+#define REQ_GET_CS_AUX_LEVEL        0x07  // wValue = slot; 2 bytes 8.8 percent LE (0 on
+                                          // AUX_OUT; STALL if not an aux)
 
 // Spectrum analyser (RTA / FFT).  Documentation/Features/spectrum_analyser_spec.md
 #define REQ_RTA_SET_CONFIG          0x08  // 12-byte RtaConfig; STALL on invalid

@@ -274,7 +274,7 @@ Any host-driven format change — SET_INTERFACE between AS alts (bit-depth switc
 **Persistence (compat-breaking).** Wire `WIRE_FORMAT_VERSION=16` (direct 8-input matrix/preamp + 17-channel EQ; no tail-append/version gates; 5864 B). Flash `SLOT_DATA_VERSION=21` (direct layout; the slot spans **2 flash sectors** on RP2350; 1 on RP2040). No migration — pre-version data loads factory defaults.
 
 ### Notification Endpoint (device→host push)
-*Last updated: 2026-09-05 (NOTIFY_EVT_CS_AUX 0x0C added; 2026-07-13: NOTIFY_EVT_ADAT_INPUT_STATE 0x0B added)*
+*Last updated: 2026-09-07 (NOTIFY_EVT_CS_AUX 0x0C is now 9 bytes, carrying the binding slot and an 8.8 percent level; 2026-09-05: NOTIFY_EVT_CS_AUX 0x0C added; 2026-07-13: NOTIFY_EVT_ADAT_INPUT_STATE 0x0B added)*
 
 The vendor interface carries one **bulk IN** endpoint (EP 0x83, wMaxPacketSize = 64) for out-of-band device→host notifications. The transport runs two protocol versions in parallel: v1 (8-byte `MASTER_VOLUME` packets, kept for existing host apps) and v2 (generic `PARAM_CHANGED` + discrete events, the primary protocol going forward). `USB_BCD_DEVICE = 0x0201` so Windows re-reads descriptors after the 8→64 byte EP bump.
 
@@ -307,7 +307,7 @@ See `Documentation/Features/notification_protocol_v2_spec.md` for the full proto
 
 **Bulk operations** (preset load, factory reset, bulk SET): wrapped in `notify_begin_bulk(source)` / `notify_end_bulk()`. Per-field writes don't flood the ring; the host sees one `BULK_INVALIDATED` and reads `REQ_GET_ALL_PARAMS` for the full state. Preset load also emits `NOTIFY_EVT_PRESET_LOADED(slot)` before the bulk opens.
 
-**Discrete event IDs** on this transport: `NOTIFY_EVT_PARAM_CHANGED` (0x02), `NOTIFY_EVT_BULK_INVALIDATED` (0x03), `NOTIFY_EVT_PRESET_LOADED` (0x04), `NOTIFY_EVT_INPUT_FORMAT` (0x05), `NOTIFY_EVT_SIGGEN_STATE` (0x07), `NOTIFY_EVT_ADAT_STATE` (0x08), `NOTIFY_EVT_I2S_SLAVE_STATE` (0x09, 9-byte packet `[ver=2, 0x09, flags=0, seq, state, rate_LE32]`; pushed on every I2S clock-slave lock-state transition), `NOTIFY_EVT_CS_IR_LEARN` (0x0A), `NOTIFY_EVT_ADAT_INPUT_STATE` (0x0B), and `NOTIFY_EVT_CS_AUX` (0x0C). Siggen announces test-signal-generator start/stop/completion as an 8-byte packet `[ver=2, 0x07, flags=0, seq, state, reason, signal_type, channel]` (state = `SiggenState`, reason = `SIGGEN_STOP_*`, channel = walk channel or 0xFF); pushed from `siggen_service()` in the main loop, never from the render path (see "Test Signal Generator"). CS_IR_LEARN announces IR learn completion as a 12-byte packet `[ver=2, 0x0A, flags=0, seq, state, protocol, 0, 0, code_LE32]` (state = `CS_IR_LEARN_DONE`/`_TIMEOUT`), pushed from the Control Surfaces tick. ADAT_INPUT_STATE (RP2350) announces every ADAT input lock-state transition as a 10-byte packet `[ver=2, 0x0B, flags=0, seq, state, rate_LE32, clock_mode]` (state = `AdatInputState`; rate = 0 unless LOCKED), pushed from the ADAT RX poll (see "ADAT Input"). CS_AUX announces every Control Surfaces auxiliary output change as an 8-byte packet `[ver=2, 0x0C, flags=0, seq, aux, state, level, src]` (both values on every event; `src` = the dispatch's `ParamSource`, so a bound control reads as GPIO and a host write as HOST_SET), pushed from the `REQ_SET_CS_AUX_STATE` / `_LEVEL` handlers (see "Control Surfaces").
+**Discrete event IDs** on this transport: `NOTIFY_EVT_PARAM_CHANGED` (0x02), `NOTIFY_EVT_BULK_INVALIDATED` (0x03), `NOTIFY_EVT_PRESET_LOADED` (0x04), `NOTIFY_EVT_INPUT_FORMAT` (0x05), `NOTIFY_EVT_SIGGEN_STATE` (0x07), `NOTIFY_EVT_ADAT_STATE` (0x08), `NOTIFY_EVT_I2S_SLAVE_STATE` (0x09, 9-byte packet `[ver=2, 0x09, flags=0, seq, state, rate_LE32]`; pushed on every I2S clock-slave lock-state transition), `NOTIFY_EVT_CS_IR_LEARN` (0x0A), `NOTIFY_EVT_ADAT_INPUT_STATE` (0x0B), and `NOTIFY_EVT_CS_AUX` (0x0C). Siggen announces test-signal-generator start/stop/completion as an 8-byte packet `[ver=2, 0x07, flags=0, seq, state, reason, signal_type, channel]` (state = `SiggenState`, reason = `SIGGEN_STOP_*`, channel = walk channel or 0xFF); pushed from `siggen_service()` in the main loop, never from the render path (see "Test Signal Generator"). CS_IR_LEARN announces IR learn completion as a 12-byte packet `[ver=2, 0x0A, flags=0, seq, state, protocol, 0, 0, code_LE32]` (state = `CS_IR_LEARN_DONE`/`_TIMEOUT`), pushed from the Control Surfaces tick. ADAT_INPUT_STATE (RP2350) announces every ADAT input lock-state transition as a 10-byte packet `[ver=2, 0x0B, flags=0, seq, state, rate_LE32, clock_mode]` (state = `AdatInputState`; rate = 0 unless LOCKED), pushed from the ADAT RX poll (see "ADAT Input"). CS_AUX announces every Control Surfaces auxiliary output change as a 9-byte packet `[ver=2, 0x0C, flags=0, seq, slot, state, level_q8_LE, src]` (`slot` = the binding slot holding the aux component, `level_q8` = 8.8 percent and 0 on a `CS_TYPE_AUX_OUT` slot; both values on every event; `src` = the dispatch's `ParamSource`, so a bound control reads as GPIO and a host write as HOST_SET), pushed from the `REQ_SET_CS_AUX_STATE` / `_LEVEL` handlers (see "Control Surfaces").
 
 **Drain:** each consumer drains its own tail via `notify_peek_next_for(consumer, ...)` / `notify_commit_pop_for(consumer)`. The USB consumer (`usb_notify_drain` in usb_audio.c) claims EP 0x83 via `usbd_edpt_claim`, formats the next packet into the stable TX buffer, and submits via `usbd_edpt_xfer`; on success `notify_commit_pop_for(USB)` advances the USB tail, and on xfer rejection the entry stays queued for the next tick. The UART consumer drains from `uart_ctrl_poll` (see "Multi-consumer ring").
 
@@ -1553,10 +1553,10 @@ Last 12 sectors (48 KB) of flash:
 | 1-10 | -44 KB to -8 KB | `0x44535033` ("DSP3") | Preset Slots 0-9 (full DSP state) |
 | 11 | -4 KB | `0x44535031` ("DSP1") | Legacy sector (migration source) |
 
-### Preset Directory Fields (Version 20)
-*Last updated: 2026-09-05 (V20 appends the Control Surfaces auxiliary output table; 2026-08-12: V19 appends the display config and page table)*
+### Preset Directory Fields (Version 21)
+*Last updated: 2026-09-07 (V21 drops the V20 auxiliary output table and restores the V19 layout; 2026-09-05: V20 appended that table; 2026-08-12: V19 appends the display config and page table)*
 
-`DIR_VERSION_CURRENT` = 20. V4 renamed the former `include_pins` byte to
+`DIR_VERSION_CURRENT` = 21. V4 renamed the former `include_pins` byte to
 `output_config_mode` (same offset, 1:1 value mapping) and appended the
 device-global `FlashOutputConfig` block. V5 grew that block by 3 bytes for the
 I2S multichannel input pins (`i2s_rx_pin_ext[3]`). V6 appends the device-level
@@ -1634,20 +1634,21 @@ binding is first applied, never at migration, so a migrated device shows
 nothing until configured. `dir_sanitize_cs_display()` resets the whole blob on
 an implausible version or dirty reserved bytes, clamps `mode` and `home_page`,
 and clears any page carrying unknown flag bits (page nouns are
-platform-dependent and validate at apply / render time). V20 appends the
-Control Surfaces auxiliary output table (292-byte `CsAuxConfig`: version + 8x
-36-byte `CsAuxCfg`, each a boot mode, boot state, boot level and 32-byte name)
-after `cs_display`, taking `sizeof(PresetDirectory)` to 3327 bytes of the 4 KB
-sector. The V19 layout is byte-identical to the V20 prefix (frozen
+platform-dependent and validate at apply / render time). V20 appended a
+292-byte Control Surfaces auxiliary output table after `cs_display`, taking
+`sizeof(PresetDirectory)` to 3327 bytes. **V21 removes it again**, because
+auxiliary outputs became binding-slot components (caps v18) rather than a
+separate table, so `PresetDirectory` is back to 3035 bytes of the 4 KB sector
+and V21 is byte-identical to V19. `DIR_VERSION_CURRENT` is 21. The V19->V21
+step therefore copies the whole V19 data block unchanged (frozen
 `PresetDirectory_v19` snapshot plus `_Static_assert`s pinning the 3035-byte
-geometry and the `cs_display` offset), so the V19->V20 step is a prefix copy
-with the new blob zero-filled, which means every output off, 0 %, unnamed and
-boot-fixed. Like the other Control Surfaces blobs it is board-level and
-survives a factory reset. `dir_sanitize_cs_aux()` resets the whole blob on an
-implausible version or dirty reserved bytes, clears any record with an
-out-of-range boot mode, state or level, and force-terminates every name so
-hand-edited flash cannot hand an unterminated string to a
-`REQ_GET_CS_AUX_CFG` reader. The V19 `dir_sanitize_cs_display()` mask was also
+geometry and the `cs_display` offset). The V20->V21 step verifies the V20 CRC,
+then copies the V20 data block up to (and excluding) the dropped 292-byte
+block and discards it, so any aux output configured on a V20 build is lost and
+must be recreated as a binding-slot component. `PresetDirectory_v20` is kept as
+a frozen 3327-byte migration-only layout with the dropped block declared as an
+opaque `uint8_t[292]`; `dir_sanitize_cs_aux()` is gone with the table it
+guarded. The V19 `dir_sanitize_cs_display()` mask was also
 missing `CS_DPAGE_BAR`, which wiped saved level-bar pages at every boot. It
 now accepts the flag. See
 `Documentation/Features/output_config_independent_load.md`,
@@ -1677,7 +1678,11 @@ now accepts the flag. See
 | cs_groups | Control Surfaces target groups (V18+, 324-byte `CsGroupConfig`: version + 8x 40-byte `CsGroup`; all-zero = no groups; board-level, survives factory reset) |
 | cs_macros | Control Surfaces macros (V18+, 1060-byte `CsMacroConfig`: version + 8x 132-byte `CsMacro`, each 32-byte name + step count + 8x 12-byte `CsMacroStep`; all-zero = no macros; board-level, survives factory reset) |
 | cs_display | Control Surfaces display config and pages (V19+, 80-byte `CsDisplayFlash`: version + 12-byte `CsDisplayCfg` + 16x 4-byte `CsDisplayPage`; all-zero = display idle, no pages; board-level, survives factory reset) |
-| cs_aux | Control Surfaces auxiliary outputs (V20+, 292-byte `CsAuxConfig`: version + 8x 36-byte `CsAuxCfg` (boot mode, boot state, boot level, 32-byte name); all-zero = every output off, 0 %, unnamed, boot-fixed; board-level, survives factory reset) |
+
+Auxiliary outputs have no directory field of their own. Since caps v18 they
+are `CS_TYPE_AUX_OUT` / `CS_TYPE_AUX_PWM` components inside `cs_config`, named
+through `cs_names` like any other slot. (Historical: V20 alone carried a
+292-byte `cs_aux` table here, dropped at V21.)
 
 ### Preset Slot Data (Version 12)
 *Last updated: 2026-09-04 (subharm third band / selectivity / ceiling / link, slot V37; `SLOT_DATA_VERSION` now 37)*
@@ -2061,7 +2066,7 @@ masked, and PDM claims its channel once at init.
 ---
 
 ## Memory Layout
-*Last updated: 2026-09-07 (spectrum analyser, single transform up to 2048 points; 2026-09-05: Control Surfaces auxiliary outputs: +~650 B BSS both platforms; preset directory now 3327 B at V20; 2026-08-12: Control Surfaces display, +~750 B BSS both platforms, ~12 KB flash)*
+*Last updated: 2026-09-07 (auxiliary outputs reworked as binding-slot components: +~130 B BSS both platforms, preset directory back to 3035 B at V21; spectrum analyser, single transform up to 2048 points; 2026-08-12: Control Surfaces display, +~750 B BSS both platforms, ~12 KB flash)*
 
 > **Spectrum analyser (2026-09-07).** One capture buffer sized for the largest
 > transform (2048 points): **4,096 B on RP2040 (Q15) / 8,192 B on RP2350
@@ -2263,12 +2268,15 @@ and warns on flash reached through linker long-call veneers (cold paths); Check
 > and runs from XIP. The preset directory grows by the 80-byte blob to 3035 of
 > its 4 KB sector at V19, so the flash layout is again unchanged.
 >
-> **Control Surfaces auxiliary outputs (2026-09-05, caps v17).** Roughly 650 B
-> more BSS on both platforms. That is the 292-byte live `CsAuxConfig`, the same
-> again in the `dir_cache` mirror, 16 B of live state and level, and the
-> 36-byte deferred SET handoff. All of it is control-path, none of it hot. The
-> preset directory grows by the 292-byte blob to 3327 of its 4 KB sector at
-> V20, so the flash layout is again unchanged.
+> **Control Surfaces auxiliary outputs (2026-09-07, caps v18).** Roughly 130 B
+> more BSS on both platforms. That is a 4-byte value-carry entry per binding
+> slot (the stash that keeps a relay from clicking across a revert or a
+> same-type re-apply) plus 3 bytes per slot of runtime record for the live
+> on/off flag and 8.8 level. All of it is control-path, none of it hot. The
+> caps v17 model's roughly 650 B is gone, and the preset directory drops its
+> 292-byte block to return to 3035 of its 4 KB sector at V21, so the flash
+> layout is again unchanged. Current sizes after the change are 263,356 text
+> and 150,016 bss on RP2040, 310,572 text and 355,188 bss on RP2350.
 
 ### RP2040 (264 KB SRAM)
 
@@ -2569,15 +2577,16 @@ format version is unchanged by this feature.
 ---
 
 ## Control Surfaces (User-Wired Physical Controls)
-*Last updated: 2026-09-05 (caps v17: auxiliary outputs, nouns 68-69, target kind 5, commands 0x02-0x07, directory V20; caps v16: subharmonic band-level nouns widened to +12 dB; 2026-09-04 caps v15: subharmonic synthesizer nouns 61-67; 2026-09-02 caps v14: subharmonic synthesizer nouns 57-60; 2026-08-24: input-source stepping skips unselectable sources; caps v13: display level bars; caps v12: per-LED PWM brightness ceiling; caps v11: display line alignment and edit markers; caps v10: I2C display component, IR group support, nouns 53-56, commands 0x27-0x2B, directory V19)*
+*Last updated: 2026-09-07 (caps v18: auxiliary outputs are binding-slot components CS_TYPE_AUX_OUT 9 / CS_TYPE_AUX_PWM 10, nouns 68-69 target the slot, commands 0x04-0x07, directory V21; caps v17 never shipped; caps v16: subharmonic band-level nouns widened to +12 dB; 2026-09-04 caps v15: subharmonic synthesizer nouns 61-67; 2026-09-02 caps v14: subharmonic synthesizer nouns 57-60; 2026-08-24: input-source stepping skips unselectable sources; caps v13: display level bars; caps v12: per-LED PWM brightness ceiling; caps v11: display line alignment and edit markers; caps v10: I2C display component, IR group support, nouns 53-56, commands 0x27-0x2B, directory V19)*
 
 User-wired push buttons, toggle switches, potentiometers, quadrature rotary
-encoders, plain indicator LEDs, PWM-dimmed LEDs, an IR remote receiver, and an
-I2C character/OLED display on
+encoders, plain indicator LEDs, PWM-dimmed LEDs, an IR remote receiver, an
+I2C character/OLED display, and switched or dimmable auxiliary outputs on
 spare GPIOs, configured over vendor commands `0x84`-`0x87`, `0x8B`/`0x8C`
 (per-slot names), `0x8D`-`0x8F` (IR commands and learn), `0x9D`/`0x9E`
 (save/revert), `0x20`-`0x26` (target groups and macros), `0x27`-`0x2B`
-(display config, pages and status), and `0x02`-`0x07` (auxiliary outputs).
+(display config, pages and status), and `0x04`-`0x07` (auxiliary output
+runtime state and level).
 A binding attaches
 one component (`CsType`)
 to one firmware parameter (`CsNoun`) through one operation (`CsAction`), on one
@@ -2744,14 +2753,26 @@ already carries. Display labels are "Sub 56-80", "Sub Select", "Sub Depth",
 (`SUBHARM_LOW`, `SUBHARM_HIGH`, `SUBHARM_TOP`) from -30..+6 to -30..+12 dB.
 Range change only; no nouns, structures or stored config change.
 
-**Caps v17** (2026-09-05) adds auxiliary outputs (subsection below). The
-additions are nouns `CS_NOUN_AUX` (68) and `CS_NOUN_AUX_LEVEL` (69), the
-target kind `CS_TARGET_AUX` (5), status code `CS_STATUS_INVALID_AUX` (0x26),
-commands `0x02`-`0x07`, and directory V20. `noun_count` goes to 70. No existing
-structure changes size and no existing GET changes length, so external
-clients doing exact-length readback are unaffected until they opt in;
-`CsCapsHeader` gains no field, and a host counts the eight outputs from
-`target_count` in the two new noun descriptors.
+**Caps v17** (2026-09-05) never shipped. It modelled auxiliary outputs as a
+separate table of eight pinless on/off + level values (`CsAuxCfg` /
+`CsAuxConfig`, commands `0x02`-`0x07`, directory V20) that an LED binding had
+to follow to reach a pin. No device or host ever ran it, and caps v18 replaces
+it outright.
+
+**Caps v18** (2026-09-07) makes an auxiliary output a component in a binding
+slot that owns its GPIO (subsection below). Two type-table entries are
+appended, `CS_TYPE_AUX_OUT` (9, on/off) and `CS_TYPE_AUX_PWM` (10, dimmable),
+so `CS_TYPE_COUNT` is 11 and `CsCapsHeader` grows from 44 to 52 bytes. Both are
+containers with an all-zero action mask, one pin and pin class ANY. A host that
+already locates the v3 tail at `4 + 4*type_count` needs no change; one that
+hardcoded the header length does. The other additions are nouns `CS_NOUN_AUX`
+(68) and `CS_NOUN_AUX_LEVEL` (69), the target kind `CS_TARGET_AUX` (5, which
+addresses the binding slot holding the output), status code
+`CS_STATUS_INVALID_AUX` (0x26), commands `0x04`-`0x07`, and directory V21.
+`noun_count` goes to 70. `CsBinding` byte 22 becomes `extras`, which must stay
+0 on every non-aux type, so pre-v18 bindings remain valid unchanged; no
+structure changes size and no other GET changes length, so external clients
+doing exact-length readback are unaffected until they opt in.
 
 ### File layout
 
@@ -3166,7 +3187,7 @@ the value row, 128 steps, glyphs knocked out of a lit block. Neither the
 merged line nor a bar row takes the configured alignment. `CS_DPAGE_BAR` was
 missing from `dir_sanitize_cs_display()`'s accepted flag mask, so since caps
 v13 every saved page carrying a bar was cleared at the next boot. The mask now
-includes it (fixed with the caps v17 work).
+includes it (fixed alongside the first auxiliary output work).
 
 **Front-panel editing.** `CS_NOUN_DISPLAY_PAGE` (54) browses the active pages
 (steps skip empty slots through the same `cs_enum_step` occupancy path as
@@ -3214,73 +3235,111 @@ caps change, `REQ_GET_CS_DISPLAY_PAGE` (0x2A) returns one 4-byte record, and
 count). At boot the display blob loads before the bindings, so a stored
 display binding's attach sees its stored pages and does not re-seed.
 
-### Auxiliary outputs (caps v17, 0x02-0x07)
-*Last updated: 2026-09-05 (auxiliary outputs added: nouns 68-69, target kind 5, commands 0x02-0x07, directory V20)*
+### Auxiliary outputs (caps v18, 0x04-0x07)
+*Last updated: 2026-09-07 (reworked as binding-slot components: CS_TYPE_AUX_OUT 9 / CS_TYPE_AUX_PWM 10, nouns 68-69 target the slot, 8.8 level, commands 0x04-0x07, directory V21; caps v17's pinless table never shipped)*
 
-Wire detail (every struct, status code and command payload) is in
+Wire detail (every field, status code and command payload) is in
 `Documentation/Features/control_surfaces_aux_spec.md`; this subsection covers
 the firmware structure only.
 
-**What they are.** Eight device-global user values the firmware attaches no
-meaning to, each an on/off `state` and a 0..100 `level` (`CS_MAX_AUX` = 8).
-Nothing in the audio path reads them. Two nouns address them through the new
-target kind `CS_TARGET_AUX` (5). `CS_NOUN_AUX` (68) is the bool half
-(BOOL-RW) and `CS_NOUN_AUX_LEVEL` (69) the continuous percent 0..100
-(CONT-RW). Both dispatch through `vendor_dispatch_set(CTRL_SOURCE_GPIO, ...)`
-with `REQ_SET_CS_AUX_STATE` / `REQ_SET_CS_AUX_LEVEL` like every other noun, so
-a panel toggle and a host write take the same path; the level is rounded to
-whole percent, never truncated. Live reads are single-byte loads from a volatile array, so aux
-nouns cost nothing in the 8 ms indicator tick. Groups are not supported on
-them (a grouped reference or a `CsGroup` with `target_kind` 5 is rejected with
-`CS_STATUS_INVALID_GROUP`), and the display's `CYCLE_ALL` mode walks
-untargeted nouns only, so aux outputs reach the panel as explicit pages.
+**What they are.** GPIOs the firmware attaches no audio meaning to, for an
+amplifier trigger, a speaker relay, a panel lamp or a fan. Each is a component
+in one of the 16 binding slots, either `CS_TYPE_AUX_OUT` (9, on/off) or
+`CS_TYPE_AUX_PWM` (10, dimmable on a hardware PWM slice). Both are container
+types like `CS_TYPE_IR` and `CS_TYPE_DISPLAY`, with an all-zero caps action
+mask, one pin and pin class ANY. The slot owns the pin, the per-slot name, the
+invert sense, the TON/TOF delays, the PWM ceiling and the boot values, so an
+aux output is configured exactly the way a button or an LED is. Nothing in the
+audio path reads them.
 
-**No pin is claimed.** The firmware never takes a GPIO for an aux output. A
-physical pin follows one only when the user binds an ordinary `CS_TYPE_LED`
-(`IND_EQUALS`, `value = 1`, `CS_FLAG_INVERT` for the active-low relay and
-opto modules, `on_delay` / `off_delay` for warm-up and hold-off) or
-`CS_TYPE_LED_PWM` (`IND_LEVEL` on the level noun, with the existing squared
-perceptual curve, `base_bright` ceiling and `range_min` / `range_max` span).
-That is the whole point of the design. An amplifier trigger, a speaker relay
-or a panel lamp becomes a first-class front-panel value that buttons, IR
-commands, macros and display pages already know how to drive, with no new
-GPIO ownership, indicator code or audio-path involvement.
+**How a control reaches one.** Through the noun, with `target` = the slot
+holding the output and target kind `CS_TARGET_AUX` (5, `target_count` =
+`CS_MAX_BINDINGS`). `CS_NOUN_AUX` (68) is the bool half (BOOL-RW) and
+`CS_NOUN_AUX_LEVEL` (69) the continuous percent 0..100 (CONT-RW, PWM slots
+only). Both dispatch through `vendor_dispatch_set(CTRL_SOURCE_GPIO, ...)` with
+`REQ_SET_CS_AUX_STATE` / `REQ_SET_CS_AUX_LEVEL` like every other noun, so a
+panel toggle and a host write take the same path. The level is 8.8 percent in
+RAM, on the wire and in the noun value, so any `step` is valid and there is no
+rounding nudge. Groups are not supported (a grouped reference or a `CsGroup`
+with `target_kind` 5 is rejected with `CS_STATUS_INVALID_GROUP`), and the
+display's `CYCLE_ALL` mode walks untargeted nouns only, so aux outputs reach
+the panel as explicit pages. Ordinary LED bindings may still follow noun 68 or
+69 as optional extra indicators.
 
-**Config record.** Per slot, a 36-byte `CsAuxCfg` (`boot_mode`, `boot_state`,
-`boot_level`, `reserved`, 32-byte `name`), gathered into a 292-byte
-`CsAuxConfig` (version + 8 records). All-zero means off, 0 %, unnamed and
-boot-fixed, so a fresh or migrated directory needs no seeding. The cfg SET
-(`REQ_SET_CS_AUX_CFG`, 0x02) is deferred to the main loop through the same
-single-deep handoff as the group SET and is a live-only preview under the
-shared CS dirty flag, reporting through `cs_last_status` with `cs_last_slot` =
-`0x70 | aux`. `control_surfaces_apply_aux_cfg()` rejects a bad index with
-`CS_STATUS_INVALID_AUX` (0x26) and an out-of-range boot field with
-`CS_STATUS_INVALID_VALUE`, leaving the stored record intact.
+**Validation and dependents.** `cs_noun_validate_target_ch()` is strict at bind
+time: noun 68 needs either aux type in the target slot, noun 69 needs
+`CS_TYPE_AUX_PWM`, and anything else is `CS_STATUS_INVALID_AUX` (0x26), whose
+meaning is now "target slot is not an aux output, or the level noun targets a
+non-PWM aux slot". An out-of-range target or non-zero index stays
+`CS_STATUS_INVALID_TARGET`. When an aux slot appears, vanishes or changes kind,
+`cs_revalidate_aux_dependents()` re-checks every non-grouped binding, IR
+command and macro step on nouns 68/69 targeting it, taking active ones down
+(releasing their pins) and resurrecting down ones that validate again, the same
+rule a group edit follows. Display pages are not re-validated; a page whose
+target stops being an aux simply shows Off or 0 %.
 
-**Boot, save, revert.** At boot every slot's live state and level come from
-`boot_state` / `boot_level` in both modes. `CS_AUX_BOOT_SAVED` differs only at
-save time: `control_surfaces_aux_prepare_save()` (called from the REQ_CS_SAVE
-handler in `main.c` before the config is copied out) folds the live values
-into those two fields, so the output returns the way it was last saved.
-Nothing writes flash on a toggle, and there is deliberately no
-"remember on every change" mode: a flash write freezes the audio clocks for
-roughly 44 ms, which is not something a front-panel button may do.
-`REQ_CS_REVERT` reloads the stored cfg (names and boot values) but leaves the
-live state and level alone, since reverting a config preview must not click a
-relay; for the same reason the live values are outside the dirty flag.
+**Live values and pin drive.** The on/off flag and 8.8 level live in the slot's
+`CsRuntime` record, and exist only while the slot is UP. A slot held down by a
+pin conflict reads 0 and refuses writes, since a value set then would be lost
+to the boot fields when it came back. `cs_tick_aux()` runs at the indicator
+decimation (every 8 ms per slot). An `AUX_OUT` pin follows the flag through the
+same `cs_ind_delay()` TON/TOF filter an indicator LED uses, with
+`CS_FLAG_INVERT` applied last. An `AUX_PWM` pin emits its level only while the
+flag is on, so off is 0 % duty; `cs_aux_duty()` squares the normalised level by
+default (linear with `CS_AUX_X_LINEAR`), scales by `base_bright`, then inverts.
+`cs_type_is_pwm()` now covers both `CS_TYPE_LED_PWM` and `CS_TYPE_AUX_PWM`, so
+they share the slice-output conflict check and the slice-release rule. In
+`cs_claim_pins()` the pin is driven to its initial value *before* the direction
+or PWM mux is set, so a relay never glitches through the off state on the way
+up.
 
-**Runtime SETs and notification.** `REQ_SET_CS_AUX_STATE` (0x04) and
-`REQ_SET_CS_AUX_LEVEL` (0x06) apply in the handler with no flash, no dirty
-flag and no deferral, from USB, UART, I2C or the CS engine. Each pushes
-`NOTIFY_EVT_CS_AUX` (0x0C), an 8-byte packet
-`[ver=2, 0x0C, flags=0, seq, aux, state, level, src]` carrying both values and
-the dispatch source (`PARAM_SRC_GPIO` for a bound control, `HOST_SET` / `UART`
-/ `I2C` for the transports), which is how the Console learns a panel button
-moved an aux output. `REQ_GET_CS_AUX_STATE` with `wValue = 0xFFFF` returns all
-16 bytes (`state[0..7]` then `level[0..7]`) for a host's initial sync.
+**Config fields.** All in the ordinary 24-byte `CsBinding`. `gpio[0]` is the
+pin, `flags` may carry only `CS_FLAG_INVERT`, `on_delay`/`off_delay` are the
+TON/TOF filter, `base_bright` is the PWM ceiling (AUX_PWM only), `value` is the
+boot level in 8.8 percent (AUX_PWM only), and byte 22, formerly `reserved2[0]`,
+is now `extras`. Its bits are `CS_AUX_X_BOOT_ON` (0x01), `CS_AUX_X_BOOT_SAVED`
+(0x02), `CS_AUX_X_LINEAR` (0x04, AUX_PWM only) and mask `CS_AUX_X_MASK` (0x07).
+`extras` must be 0 on every other type, so pre-v18 configs stay valid.
+`cs_validate_aux_container()` rejects any other non-zero field.
 
-**Display.** An aux page's label is the slot's name when set, else "Aux N"
-(N = target + 1), with " Level" (" Lvl" on the tight two-row bar layout)
+**Boot, save, revert.** `cs_load_stored_bindings()` runs a two-pass load with
+aux slots applied first, so a control that targets one validates whatever the
+slot order. The boot flag comes from `CS_AUX_X_BOOT_ON` and the boot level from
+`value`, with the delay filter starting in agreement with the pin rather than
+timing the boot value. `control_surfaces_aux_prepare_save()` (called from the
+`REQ_CS_SAVE` handler in `main.c` before the config is copied out) folds each
+UP `CS_AUX_X_BOOT_SAVED` slot's live flag and level back into
+`CS_AUX_X_BOOT_ON` and `value`. Nothing writes flash on a toggle and nothing
+sets the dirty flag, and there is deliberately no "remember on every change"
+mode, because a flash write freezes the audio clocks for roughly 44 ms.
+`REQ_CS_REVERT` stashes the live flag and level of every UP aux slot in
+`s_aux_carry[]` and hands each back to the slot that reloads with the same
+type, so a revert never snaps a relay to its boot value; `cs_seed_runtime()`
+consumes the carry. A host binding SET that keeps the same type (rename, delay,
+ceiling, boot-field edit) carries the value the same way. Changing the type
+resets the slot to its boot value.
+
+**Runtime SETs and notification.** `REQ_SET_CS_AUX_STATE` (0x04, 1 byte) and
+`REQ_SET_CS_AUX_LEVEL` (0x06, 2 bytes 8.8 LE, clamped to 25600) apply in the
+handler with no flash, no dirty flag and no deferral, from USB, UART, I2C or
+the CS engine, with `wValue` = the binding slot. A slot that is not an aux
+output that is UP is rejected with `CS_STATUS_INVALID_AUX` and `cs_last_slot` = the
+plain slot number (UART/I2C return `CTRL_DISPATCH_ERROR`; USB acknowledges the
+OUT stage as it does for every OUT command, so the host reads `REQ_GET_CS_STATUS`).
+The old `0x70 | aux` tag is gone, and `REQ_GET_CS_STATUS` /
+`slot_status` report an aux slot like any other binding slot. A short payload
+is rejected with `CS_STATUS_INVALID_VALUE`. Each changing write pushes
+`NOTIFY_EVT_CS_AUX` (0x0C), now a 9-byte packet
+`[ver=2, 0x0C, flags=0, seq, slot, state, level_q8_LE, src]` carrying both
+values and the dispatch source (`PARAM_SRC_GPIO` for a bound control,
+`HOST_SET` / `UART` / `I2C` for the transports), which is how the Console
+learns a panel button moved an aux output. Unchanged writes are silent.
+`REQ_GET_CS_AUX_STATE` with `wValue = 0xFFFF` returns 48 bytes (`state[16]`
+then sixteen little-endian 8.8 `level_q8`, zero on slots that are not UP aux
+outputs) for a host's initial sync.
+
+**Display.** An aux page's label is the slot's own name when set, else "Aux N"
+(N = slot + 1), with " Level" (" Lvl" on the tight two-row bar layout)
 appended for the level noun. Values render "On"/"Off" and "NN%", the latter
 supporting the caps v13 level bar, and both nouns are writable so a page is
 editable from the panel.
@@ -3293,10 +3352,10 @@ The binding table is device-global in the preset directory (388-byte
 factory reset and is not part of `WireBulkParams`. The per-slot names live
 next to it (V10, `cs_names[16][32]`) and the IR command table follows (V11,
 132-byte `CsIrConfig`: version + 8x 16-byte `IrCommand`), with the group table
-(V18, 324-byte `CsGroupConfig`), macro table (V18, 1060-byte `CsMacroConfig`),
-display blob (V19, 80-byte `CsDisplayFlash`) and auxiliary output table
-(V20, 292-byte `CsAuxConfig`) appended last, all with the
-same lifetime. On RP2040
+(V18, 324-byte `CsGroupConfig`), macro table (V18, 1060-byte `CsMacroConfig`)
+and display blob (V19, 80-byte `CsDisplayFlash`) appended last, all with the
+same lifetime. Auxiliary outputs need no blob of their own: since caps v18
+they are components inside `CsFlashConfig`, named through `cs_names`. On RP2040
 `control_surfaces.c.o`, `control_surfaces_nouns.c.o`, and the decode side of
 `control_surfaces_ir.c.o` execute from flash XIP
 (see Memory Layout); only the IR edge ISR is RAM-pinned
@@ -3314,16 +3373,16 @@ and 17 `CsGroupOp` contexts (16 binding slots plus the macro sequencer) whose
 The caps v10 display adds roughly 750 B more BSS on both platforms and ~12 KB
 of flash (per-model drivers and init scripts, the 5x8 font, the noun label
 table); `control_surfaces_display.c.o` is cold and runs from flash XIP on
-RP2040 like the rest of the engine. The caps v17 auxiliary outputs add
-roughly 650 B more BSS on both platforms. That is the 292-byte live table, the
-same again in the `dir_cache` mirror, 16 B of live state and level, and the
-36-byte deferred SET handoff. All of it is main-loop / control path, so nothing new
+RP2040 like the rest of the engine. The caps v18 auxiliary outputs add
+roughly 130 B more BSS on both platforms. That is a 4-byte value-carry entry
+per binding slot plus 3 bytes per slot of runtime record for the live on/off
+flag and 8.8 level. All of it is main-loop / control path, so nothing new
 lands on a hot path and the audio path is untouched.
 
 ---
 
 ## Vendor Command Reference
-*Last updated: 2026-09-07 (spectrum analyser V2 bank/fast-only bins, 0x08-0x0F; 2026-09-05: Control Surfaces auxiliary outputs 0x02-0x07; 2026-09-04: subharmonic synthesizer widened to 0x10-0x1F, 0x2C-0x2F and 0xA9-0xAE; 2026-09-02: subharmonic synthesizer 0x10-0x1A; REQ_GET_BUILD_INFO 0x80 added 2026-09-01: 64-byte git/date build stamp)*
+*Last updated: 2026-09-07 (Control Surfaces auxiliary outputs are now 0x04-0x07 slot-indexed with an 8.8 level; 0x02 and 0x03 removed; spectrum analyser V2 bank/fast-only bins, 0x08-0x0F; 2026-09-04: subharmonic synthesizer widened to 0x10-0x1F, 0x2C-0x2F and 0xA9-0xAE; 2026-09-02: subharmonic synthesizer 0x10-0x1A; REQ_GET_BUILD_INFO 0x80 added 2026-09-01: 64-byte git/date build stamp)*
 
 **Band-index map (PEQ and crossover share one address space):**
 
@@ -3339,12 +3398,10 @@ lands on a hot path and the audio path is untouched.
 
 | Command | Code | Direction | Description |
 |---------|------|-----------|-------------|
-| REQ_SET_CS_AUX_CFG | 0x02 | OUT | Set one auxiliary output's config (wValue = aux 0-7, 36-byte `CsAuxCfg`: boot mode/state/level + 32-byte name). Deferred, live-only preview; `REQ_CS_SAVE` persists. Result in `REQ_GET_CS_STATUS` with `cs_last_slot` = 0x70 \| aux |
-| REQ_GET_CS_AUX_CFG | 0x03 | IN | Get one auxiliary output's live config (wValue = aux 0-7; 36 bytes) |
-| REQ_SET_CS_AUX_STATE | 0x04 | OUT | Set an auxiliary output on/off (wValue = aux 0-7, 1 byte, non-zero = on). Immediate, runtime only, no flash; pushes `NOTIFY_EVT_CS_AUX` |
-| REQ_GET_CS_AUX_STATE | 0x05 | IN | Get an auxiliary output's state (wValue = aux 0-7: 1 byte; wValue = 0xFFFF: 16 bytes, state[0..7] then level[0..7]) |
-| REQ_SET_CS_AUX_LEVEL | 0x06 | OUT | Set an auxiliary output's level (wValue = aux 0-7, 1 byte 0..100, clamped). Immediate, runtime only; pushes `NOTIFY_EVT_CS_AUX` |
-| REQ_GET_CS_AUX_LEVEL | 0x07 | IN | Get an auxiliary output's level (wValue = aux 0-7; 1 byte) |
+| REQ_SET_CS_AUX_STATE | 0x04 | OUT | Set an auxiliary output on/off (wValue = binding slot 0-15, 1 byte, non-zero = on). Immediate, runtime only, no flash, no dirty flag; pushes `NOTIFY_EVT_CS_AUX` on a change. Rejected with `CS_STATUS_INVALID_AUX` unless the slot is an aux output that is up, or `CS_STATUS_INVALID_VALUE` on a short payload (USB acknowledges the OUT stage; read `REQ_GET_CS_STATUS`). Auxiliary output *configuration* is an ordinary binding (`REQ_SET_CS_BINDING`), not a command of its own; 0x02 and 0x03 are unallocated |
+| REQ_GET_CS_AUX_STATE | 0x05 | IN | Get an auxiliary output's state (wValue = binding slot: 1 byte; wValue = 0xFFFF: 48 bytes, state[16] then sixteen little-endian 8.8 percent levels, zero on slots that are not up aux outputs) |
+| REQ_SET_CS_AUX_LEVEL | 0x06 | OUT | Set an auxiliary output's level (wValue = binding slot, 2 bytes little-endian 8.8 percent, clamped to 100 % = 25600). Immediate, runtime only; pushes `NOTIFY_EVT_CS_AUX` on a change. Rejected with `CS_STATUS_INVALID_AUX` unless the slot is an up `CS_TYPE_AUX_PWM` |
+| REQ_GET_CS_AUX_LEVEL | 0x07 | IN | Get an auxiliary output's level (wValue = binding slot; 2 bytes little-endian 8.8 percent, 0 on a `CS_TYPE_AUX_OUT` slot) |
 | REQ_RTA_SET_CONFIG | 0x08 | OUT | Set the V2 spectrum analyser config (12-byte `RtaConfig`). STALLs on wrong version or length, unknown tap, an `fft_order` outside the caps range (8..11), an unsupported `lf_mode`, or an empty `channel_mask` after masking to the tap's width |
 | REQ_RTA_GET_CONFIG | 0x09 | IN | Get the applied 12-byte `RtaConfig` (clamped `avg_ms` and `peak_decay_db_s`, masked `channel_mask`) |
 | REQ_RTA_GET_CAPS | 0x0A | IN | wValue 0: the 16-byte `RtaCaps`. wValue 1..: a chunk of the band-centre table, 32 `uint16` Hz values per chunk; a chunk past the end STALLs |

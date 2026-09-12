@@ -2583,7 +2583,10 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
                 // transfer clamps to wLength, so 4-byte readers are unaffected.
                 resp_buf[4] = FW_VERSION_MINOR;
                 resp_buf[5] = FW_VERSION_PATCH;
-                vendor_send_response(resp_buf, 6);
+                // Pre-release ordinal (0 = final).  Betas share a patch number,
+                // so a host reading only 6 bytes cannot tell two of them apart.
+                resp_buf[6] = FW_VERSION_BETA;
+                vendor_send_response(resp_buf, 7);
                 return true;
             }
 

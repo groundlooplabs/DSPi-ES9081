@@ -48,9 +48,9 @@ Response: 45 34 36 30 35 38 33 38 38 42 31 41 32 45 32 43
 **Direction:** Device → Host (GET)
 **wValue:** 0 (unused)
 **wIndex:** Vendor interface number
-**wLength:** 6 (legacy hosts request 4; the transfer clamps to wLength)
+**wLength:** 7 (older hosts request 6 or 4; the transfer clamps to wLength)
 
-### Response (6 bytes)
+### Response (7 bytes)
 
 | Offset | Size | Field | Values |
 |--------|------|-------|--------|
@@ -60,16 +60,20 @@ Response: 45 34 36 30 35 38 33 38 38 42 31 41 32 45 32 43
 | 3 | 1 | `num_outputs` | Number of output channels (compile-time `NUM_OUTPUT_CHANNELS`) |
 | 4 | 1 | `fw_minor` | Minor version, full-width |
 | 5 | 1 | `fw_patch` | Patch version, full-width |
+| 6 | 1 | `fw_beta` | `0` = final release, `1`..`255` = beta N of this patch |
 
 ### Firmware Version Decoding
 
-Request 6 bytes. If at least 6 arrive, use the full-width bytes; otherwise fall back to the legacy nibbles (correct only while minor and patch are both <= 15):
+Request 7 bytes. If at least 6 arrive, use the full-width bytes; otherwise fall back to the legacy nibbles (correct only while minor and patch are both <= 15). A reply shorter than 7 bytes comes from firmware that predates the beta ordinal, which is by definition a final release, so the missing byte decodes as 0:
 
 ```
 major = byte[1]
 minor = (len >= 6) ? byte[4] : byte[2] >> 4
 patch = (len >= 6) ? byte[5] : byte[2] & 0x0F
+beta  = (len >= 7) ? byte[6] : 0
 ```
+
+A beta sorts below the final release of the same patch, so the comparison key is `(major, minor, patch, beta == 0 ? 256 : beta)`.
 
 See `firmware_versioning_spec.md` for the versioning policy, the nibble cap, and the full compatibility matrix.
 

@@ -37,9 +37,9 @@ def serial_is_printable_hex(dev, profile, chk):
 @test("identity")
 def platform_packet(dev, profile, chk):
     """0x7F returns [platform, fw_major, legacy minor.patch nibbles,
-    num_output_channels, fw_minor, fw_patch]."""
-    p = dev.get(OP.GET_PLATFORM, 6)
-    chk.eq(len(p), 6, "platform length")
+    num_output_channels, fw_minor, fw_patch, fw_beta]."""
+    p = dev.get(OP.GET_PLATFORM, 7)
+    chk.eq(len(p), 7, "platform length")
     chk.member(p[0], (0, 1), "platform id")
     chk.eq(p[3], profile.num_output_channels, "output-channel count byte")
     chk.in_range(p[1], 0, 99, "fw major byte")
@@ -47,6 +47,13 @@ def platform_packet(dev, profile, chk):
     if p[4] <= 15 and p[5] <= 15:
         chk.eq((p[2] >> 4) & 0xF, p[4], "legacy minor nibble")
         chk.eq(p[2] & 0xF, p[5], "legacy patch nibble")
+    chk.eq(p[6], profile.fw_beta, "beta ordinal byte")
+    # Truncation to wLength is the whole backward-compatibility story; an older
+    # host asking for 6 or 4 must get exactly the bytes it always got.
+    for short_len in (6, 4):
+        q = dev.get(OP.GET_PLATFORM, short_len)
+        chk.eq(len(q), short_len, f"platform length at wLength={short_len}")
+        chk.eq(bytes(q), bytes(p[:short_len]), f"prefix match at wLength={short_len}")
 
 
 @test("identity")

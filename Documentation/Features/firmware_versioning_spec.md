@@ -2,24 +2,30 @@
 
 ## TL;DR
 
-- A firmware version is three plain numbers, such as 1.1.6. There are never any beta or rc suffixes.
-- The device can only report those three numbers over USB. A suffix like `-beta2` never reaches the host, so two builds that share a version cannot be told apart.
-- Every build that anyone outside the bench can install gets its own patch number. Private test builds keep the version they are based on and get a build label instead. No software ever compares a label.
+- A firmware version is three plain numbers plus a beta ordinal, such as 1.1.6 beta 2. A final release is beta 0 and drops the word entirely.
+- The device reports all four numbers over USB, so two betas of the same patch can be told apart by software. This is new; before it, a suffix like `-beta2` never reached the host and beta suffixes were banned outright.
+- Betas of one patch share that patch number and count upward: 1.1.6 beta 1, beta 2, beta 3, then 1.1.6 final. A final release always sorts above every beta of the same patch.
+- Private test builds keep the version they are based on and get a build label instead. No software ever compares a label.
 - The macOS Console app and the firmware ship as a matched pair with the same version. The app turns features on and off based on the version the device reports.
 - Legal ranges are major 0 to 255, minor 0 to 15, patch 0 to 255. The minor limit is a real trap and is explained under "Legal ranges" below.
 - Old hosts keep working without any change. They ask for 4 bytes and get exactly the same 4 bytes they always got.
 - Separately from the version, every binary carries an automatic git stamp readable via `REQ_GET_BUILD_INFO` (0x80) and `picotool info`. The version is the contract; the stamp is provenance. See "Build provenance" below.
 
-## Why beta suffixes are gone
+## Beta builds
 
-`REQ_GET_PLATFORM` (0x7F) is the only way a host learns which firmware is running, and it carries exactly three numbers. Both `1.1.6-beta1` and `1.1.6-beta2` report themselves as `1.1.6`. The Console's feature gating and any auto-updater see one build, not two. An updater then cannot tell whether it needs to update, and a bug report that says "1.1.6" does not say which build it means. Suffixes are therefore banned.
+`REQ_GET_PLATFORM` (0x7F) is the only way a host learns which firmware is running. It used to carry exactly three numbers, so both `1.1.6-beta1` and `1.1.6-beta2` reported themselves as `1.1.6`. The Console's feature gating and any auto-updater saw one build, not two, and a bug report that said "1.1.6" did not say which build it meant. That is why beta suffixes were banned.
 
-- **Published builds.** This means anything a user can install, test releases included. Bump the patch number. 1.1.6, then 1.1.7, then 1.1.8, and so on. Patch numbers are cheap, so burn them freely.
-- **Private test builds.** These never leave the bench. Keep the version of the release they are based on and add a build label such as a date or a short hash in the filename or the release notes. A label exists only for humans to read. Never turn test status into a version suffix.
+Byte 6 fixes the cause rather than the symptom. The beta ordinal rides on the wire alongside the three numbers, so the host can tell betas apart and betas no longer have to burn a patch number each.
+
+- **Betas.** Set `FW_VERSION_BETA` to 1 for the first beta of a patch and count upward. The patch number stays put across the whole beta run.
+- **Final releases.** Set `FW_VERSION_BETA` back to 0 in the same commit that gets tagged. A final release is strictly newer than every beta of its patch, so 1.1.6 final supersedes 1.1.6 beta 3.
+- **Private test builds.** These never leave the bench. Keep the version of the release they are based on, beta ordinal included, and add a build label such as a date or a short hash in the filename or the release notes. A label exists only for humans to read. Never turn test status into a version suffix.
+
+Tags carry the ordinal as a suffix (`v1.1.6-beta2`) because git tags are for humans. Nothing parses it; the device reports the ordinal itself.
 
 ## App and firmware are a matched pair
 
-DSPi Console reads the version the device reports and uses it to decide which features to offer. Wire-format versions, capability versions, and the per-feature `firmwareSupportsX >= N` checks all key off the answer to 0x7F. A firmware version bump must therefore ship alongside the matching app release. Bumping only one side breaks the gating contract. The app also bundles the matching `.uf2` images for its updater.
+DSPi Console reads the version the device reports and uses it to decide which features to offer. Wire-format versions, capability versions, and the per-feature `firmwareSupportsX >= N` checks all key off the answer to 0x7F. A firmware version bump must therefore ship alongside the matching app release, beta ordinal included. The app reads the whole thing, ordinal and all, from its own `MARKETING_VERSION`, which carries the tag spelling during a beta run (`1.1.6-beta2`). Bumping only one side breaks the gating contract. The app also bundles the matching `.uf2` images for its updater.
 
 ## Version macros
 
@@ -30,7 +36,10 @@ DSPi Console reads the version the device reports and uses it to decide which fe
 #define FW_VERSION_MINOR            1
 #define FW_VERSION_PATCH            6
 #define FW_VERSION_PACKED           ((FW_VERSION_MAJOR << 8) | (FW_VERSION_MINOR << 4) | FW_VERSION_PATCH)
+#define FW_VERSION_BETA             0
 ```
+
+`FW_VERSION_BETA` is independent of the packed macro and never touches the legacy bytes. It reaches the host only as byte 6.
 
 `FW_VERSION_PACKED` was once called `FW_VERSION_BCD`, which was a misleading name. It is plain nibble packing rather than BCD. Minor and patch each get 4 bits, and the macro does no range checking at all, so anything that does not fit simply overlaps its neighbour. The packed form exists only to build the legacy bytes of `REQ_GET_PLATFORM`. Nothing else may use it.
 
@@ -41,6 +50,7 @@ DSPi Console reads the version the device reports and uses it to decide which fe
 | Major | 0 to 255 | Byte 1 is a plain `uint8_t`, so 256 wraps to 0. |
 | Minor | 0 to 15 | The reported **major** number changes. See below. |
 | Patch | 0 to 255 | Legacy 4-byte hosts read the wrong patch. New 6-byte hosts stay correct. |
+| Beta | 0 to 255 | Nothing. It is a whole byte of its own with no packing. |
 
 A patch number above 15 is safe for current hosts. It overflows its nibble in byte 2, which corrupts the legacy encoding, but byte 5 still carries the true value and any host built after this change reads byte 5. This is the tradeoff the widening was made for.
 
@@ -59,9 +69,9 @@ The bulk parameter header carries the version separately as two `uint16_t` field
 **Direction:** Device to Host (GET)
 **wValue:** 0 (unused)
 **wIndex:** Vendor interface number
-**wLength:** any length. New hosts ask for 6, old hosts ask for 4, and the firmware truncates to whatever was asked for.
+**wLength:** any length. Current hosts ask for 7, earlier ones ask for 6 or 4, and the firmware truncates to whatever was asked for.
 
-### Response (6 bytes)
+### Response (7 bytes)
 
 | Offset | Size | Field | Values |
 |--------|------|-------|--------|
@@ -71,43 +81,52 @@ The bulk parameter header carries the version separately as two `uint16_t` field
 | 3 | 1 | `num_outputs` | Compile-time `NUM_OUTPUT_CHANNELS` |
 | 4 | 1 | `fw_minor` | `FW_VERSION_MINOR`, full width |
 | 5 | 1 | `fw_patch` | `FW_VERSION_PATCH`, full width |
+| 6 | 1 | `fw_beta` | `FW_VERSION_BETA`; 0 = final release, 1 to 255 = beta N |
 
 Bytes 0 to 3 are byte-for-byte identical to the historical 4-byte response. Bytes 4 and 5 repeat the minor and patch from byte 2, but each gets a whole `uint8_t`, so they stay correct past 15. Once patch goes above 15 the low nibble of byte 2 is no longer trustworthy and only byte 5 should be believed.
 
+Byte 6 has no legacy counterpart. Firmware that answers with fewer than 7 bytes predates the ordinal, and every such build was a final release, so a short reply decodes as beta 0 rather than as unknown.
+
 ### Why the old 4-byte encoding capped at 15
 
-The original response was 4 bytes, and minor and patch shared byte 2 with one nibble each. Four bits hold 0 to 15 and the packing macro never checked for overflow, so 15 was a hard ceiling on both numbers. Back when beta suffixes existed, almost no patch numbers were ever spent and that ceiling was far away. Now that every published build spends a patch number, the ceiling would arrive within a year or two, which is why bytes 4 and 5 were added.
+The original response was 4 bytes, and minor and patch shared byte 2 with one nibble each. Four bits hold 0 to 15 and the packing macro never checked for overflow, so 15 was a hard ceiling on both numbers. Back when a beta run spent no patch numbers at all, that ceiling was far away. It came into reach during the period when every published build, betas included, had to burn its own patch number, which is why bytes 4 and 5 were added. Byte 6 has since given the betas their own counter again, but the widening stands: patch numbers are still cheap and still spent freely.
 
 ### Short reads
 
-The firmware always offers 6 bytes and the transfer layer cuts the data stage down to the host's `wLength`. TinyUSB does this in `tud_control_xfer` with `tu_min16(len, request->wLength)`, and the UART and I2C dispatch paths apply the same cap. A legacy host that asks for 4 bytes therefore receives exactly the old 4-byte response.
+The firmware always offers 7 bytes and the transfer layer cuts the data stage down to the host's `wLength`. TinyUSB does this in `tud_control_xfer` with `tu_min16(len, request->wLength)`, and the UART and I2C dispatch paths apply the same cap. A legacy host that asks for 4 bytes therefore receives exactly the old 4-byte response, and one that asks for 6 receives exactly the pre-beta 6-byte response.
 
 ## Compatibility matrix
 
 | Host | Firmware | Behavior |
 |------|----------|----------|
-| Old (asks 4) | Old (offers 4) | Unchanged. 4 bytes, nibble decode. |
-| Old (asks 4) | New (offers 6) | The transfer is cut to 4 bytes. The host sees the same legacy bytes as before and decodes the nibbles. This is correct as long as minor and patch are both 15 or below. |
-| New (asks 6) | Old (offers 4) | The transfer completes short with 4 bytes and the host falls back to the nibble decode. |
-| New (asks 6) | New (offers 6) | The host receives 6 bytes and uses bytes 4 and 5. |
+| Asks 4 | Offers 4 | Unchanged. 4 bytes, nibble decode. |
+| Asks 4 | Offers 7 | The transfer is cut to 4 bytes. The host sees the same legacy bytes as before and decodes the nibbles. This is correct as long as minor and patch are both 15 or below. |
+| Asks 6 | Offers 4 | The transfer completes short with 4 bytes and the host falls back to the nibble decode. |
+| Asks 6 | Offers 7 | The transfer is cut to 6 bytes. The host reads the full-width minor and patch and never learns the beta ordinal, so it treats every build of a patch as the same build. |
+| Asks 7 | Offers 4 or 6 | The transfer completes short. The host decodes what arrived and takes beta as 0. |
+| Asks 7 | Offers 7 | The host receives all four numbers. |
 
-**Fallback rule for hosts.** Always ask for 6 bytes. If 6 or more arrive, take minor from byte 4 and patch from byte 5. If fewer than 6 arrive, decode minor as `byte[2] >> 4` and patch as `byte[2] & 0x0F`. Never mix the two decodes within one read.
+**Fallback rule for hosts.** Always ask for 7 bytes. If 6 or more arrive, take minor from byte 4 and patch from byte 5. If fewer than 6 arrive, decode minor as `byte[2] >> 4` and patch as `byte[2] & 0x0F`. Never mix the two decodes within one read. Take beta from byte 6 when 7 or more arrive, and 0 otherwise.
+
+**Ordering rule for hosts.** A beta precedes the final release of the same patch, which is the opposite of what a plain numeric compare on the four fields gives, because final is encoded as 0. Compare `(major, minor, patch, beta == 0 ? 256 : beta)`.
 
 ## Host implementation
 
 ```c
-uint8_t info[6];
+uint8_t info[7];
 int n = libusb_control_transfer(handle,
     LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_INTERFACE,
     0x7F /* REQ_GET_PLATFORM */,
     0, VENDOR_INTF,
-    info, 6, 1000);
+    info, 7, 1000);
 if (n < 4) {
     return -1;  /* identification unavailable, do not read info[] */
 }
 int major = info[1];
 int minor = (n >= 6) ? info[4] : (info[2] >> 4);
 int patch = (n >= 6) ? info[5] : (info[2] & 0x0F);
+int beta  = (n >= 7) ? info[6] : 0;
+int rank  = beta ? beta : 256;   /* final outranks every beta of the patch */
 ```
 
 ## Build provenance: REQ_GET_BUILD_INFO (0x80)

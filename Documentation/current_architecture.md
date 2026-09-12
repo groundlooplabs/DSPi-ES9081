@@ -164,6 +164,17 @@ Every build regenerates `<build dir>/DSPi/generated/build_info.h` via the `dspi_
 
 Consumers: `vendor_commands.c` serves the stamp over `REQ_GET_BUILD_INFO` (0x80), and `main.c` embeds it in the UF2's binary info (`bi_program_version_string`) so `picotool info` identifies a build file or a BOOTSEL-mode device. The stamp is provenance for humans; the version reported by `REQ_GET_PLATFORM` remains the only compatibility contract (see `Documentation/Features/firmware_versioning_spec.md`).
 
+### Firmware Version Reporting
+*Last updated: 2026-09-12*
+
+`config.h` holds the version as four macros: `FW_VERSION_MAJOR`, `FW_VERSION_MINOR`, `FW_VERSION_PATCH`, and `FW_VERSION_BETA`. `FW_VERSION_PACKED` nibble-packs minor and patch for the legacy bytes of `REQ_GET_PLATFORM` and feeds nothing else.
+
+`FW_VERSION_BETA` is the pre-release ordinal: 0 means a final release, 1 to 255 mean beta N of that patch. Betas of one patch share the patch number and count upward, so the ordinal is the only field distinguishing them, and it must return to 0 in the commit that gets tagged as final. A final release outranks every beta of its patch, so the comparison key a host must use is `(major, minor, patch, beta == 0 ? 256 : beta)`, not a plain four-field compare.
+
+The ordinal ships as byte 6 of the `REQ_GET_PLATFORM` (0x7F) response, which the firmware now offers 7 bytes long. Every transport caps the data stage at the host's `wLength`, so hosts asking for 4 or 6 bytes see exactly the responses they saw before. A reply shorter than 7 bytes comes from firmware predating the ordinal, and every such build was final, so hosts decode the missing byte as 0. Wire layout and the host fallback rules live in `Documentation/Features/firmware_versioning_spec.md` and `Documentation/Features/device_identification_spec.md`.
+
+The bulk parameter header carries `fw_version_major` / `fw_version_minor` separately and does not carry the ordinal.
+
 ---
 
 ## Initialization Flow
@@ -3525,7 +3536,7 @@ lands on a hot path and the audio path is untouched.
 | REQ_SET_OUTPUT_PIN | 0x7C | OUT | Set output GPIO pin (pin byte 0xFF = reset that output to its platform default) |
 | REQ_GET_OUTPUT_PIN | 0x7D | IN | Get output GPIO pin |
 | REQ_GET_SERIAL | 0x7E | IN | Get unique board serial |
-| REQ_GET_PLATFORM | 0x7F | IN | Get platform ID, fw version (legacy nibbles + full-width minor/patch), output count; 6 bytes |
+| REQ_GET_PLATFORM | 0x7F | IN | Get platform ID, fw version (legacy nibbles + full-width minor/patch + beta ordinal), output count; 7 bytes |
 | REQ_GET_BUILD_INFO | 0x80 | IN | Get 64-byte build stamp: git describe [0..47] + build date [48..59]; provenance only, never gated on |
 | REQ_CLEAR_CLIPS | 0x83 | IN | Read-then-clear clip flags (see Clip Detection) |
 | REQ_SET_CS_BINDING | 0x84 | OUT | Set a Control Surfaces binding (wValue=slot 0-15, payload=24-byte CsBinding, required; short payload = INVALID_VALUE); apply-live-only preview, deferred, poll 0x87; persist via REQ_CS_SAVE (see Control Surfaces) |

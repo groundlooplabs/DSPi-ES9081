@@ -42,6 +42,7 @@ class PlatformProfile:
     fw_major: int
     fw_minor: int
     fw_patch: int
+    fw_beta: int            # 0 = final release, 1..255 = beta N of this patch
     num_output_channels: int
     num_channels: int
     num_input_channels: int
@@ -56,7 +57,8 @@ class PlatformProfile:
 
     @property
     def fw_str(self) -> str:
-        return f"v{self.fw_major}.{self.fw_minor}.{self.fw_patch}"
+        base = f"v{self.fw_major}.{self.fw_minor}.{self.fw_patch}"
+        return base if self.fw_beta == 0 else f"{base}-beta{self.fw_beta}"
 
     def summary(self) -> str:
         build = f" build={self.build_info}" if self.build_info else ""
@@ -93,7 +95,7 @@ def _probe_channel_ceiling(dev: DspiDevice, hi: int = 16) -> int:
 
 
 def build_profile(dev: DspiDevice) -> PlatformProfile:
-    plat = dev.get(OP.GET_PLATFORM, 6)
+    plat = dev.get(OP.GET_PLATFORM, 7)
     platform_id = plat[0]
     fw_major = plat[1]
     if len(plat) >= 6:
@@ -103,6 +105,8 @@ def build_profile(dev: DspiDevice) -> PlatformProfile:
         # Pre-widening firmware: nibble-packed byte 2, each field caps at 15.
         fw_minor = (plat[2] >> 4) & 0x0F
         fw_patch = plat[2] & 0x0F
+    # Firmware without byte 6 predates the ordinal, and all of it was final.
+    fw_beta = plat[6] if len(plat) >= 7 else 0
     num_output_channels = plat[3]
 
     # Build provenance stamp (0x80); optional, old firmware STALLs.
@@ -133,7 +137,7 @@ def build_profile(dev: DspiDevice) -> PlatformProfile:
     return PlatformProfile(
         platform_id=platform_id,
         platform_name=PLATFORM_NAMES.get(platform_id, f"id{platform_id}"),
-        fw_major=fw_major, fw_minor=fw_minor, fw_patch=fw_patch,
+        fw_major=fw_major, fw_minor=fw_minor, fw_patch=fw_patch, fw_beta=fw_beta,
         num_output_channels=num_output_channels,
         num_channels=num_channels,
         num_input_channels=num_input_channels,

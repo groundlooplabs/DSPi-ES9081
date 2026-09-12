@@ -34,19 +34,24 @@ static uint32_t now;
 static uint32_t time_us_32(void) { return now; }
 static void __dmb(void) {}
 #include "rta.c"
+static double tone_hz=100;
 static void packet(bool tone) {
     rta_pipe_t buf[48];
     for (int i=0; i<48; ++i) {
-        double x = tone ? .5*sin(6.283185307179586*100*((double)now/1000000+i/48000.)) : 0;
+        double x = tone ? .5*sin(6.283185307179586*tone_hz*((double)now/1000000+i/48000.)) : 0;
 #if PICO_RP2350
         buf[i] = x;
 #else
         buf[i] = x*268435456.;
 #endif
     }
+    rta_pipe_t original[48]; memcpy(original,buf,sizeof(buf));
     rta_packet_begin(48);
+    for (int ch=0; ch<NUM_INPUT_CHANNELS; ++ch)
+        rta_tap(RTA_TAP_INPUT, ch, buf, 48);
     for (int ch=0; ch<NUM_OUTPUT_CHANNELS; ++ch)
         if (matrix_mixer.outputs[ch].enabled) rta_tap(RTA_TAP_OUTPUT, ch, buf, 48);
+    assert(memcmp(buf,original,sizeof(buf))==0);
     rta_packet_end(48);
     now += 1000;
     rta_service();
@@ -56,17 +61,21 @@ int main(void) {
     for (int ch=0; ch<NUM_OUTPUT_CHANNELS; ++ch) matrix_mixer.outputs[ch].enabled=true;
     rta_init();
     RtaCaps caps; rta_get_caps(&caps);
-    assert(caps.version==2 && caps.fft_order_max==10 && caps.max_bin_frame==16+512+1);
+    assert(caps.version==3 && caps.fft_order_max==10 && caps.max_bin_frame==16+512+1);
     RtaConfig cfg; rta_get_config(&cfg);
     cfg.version=1; assert(!rta_set_config(&cfg,sizeof(cfg)));
-    cfg.version=2; cfg.fft_order=11; assert(!rta_set_config(&cfg,sizeof(cfg)));
+    cfg.version=2; assert(!rta_set_config(&cfg,sizeof(cfg)));
+    cfg.version=3; cfg.fft_order=11; assert(!rta_set_config(&cfg,sizeof(cfg)));
     cfg.fft_order=caps.fft_order_default; cfg.avg_ms=0;
     assert(rta_set_config(&cfg,sizeof(cfg))); rta_service();
     rta_note_read(); rta_service();
     for (int i=0;i<300;i++) packet(true);
     for (int ch=0;ch<NUM_OUTPUT_CHANNELS;ch++) {
         RtaBandFrame f; assert(rta_get_band_frame(ch,&f));
-        assert(f.age_ms<=400 && f.avg[7]>220);
+        assert(f.age_ms<=400 && f.avg[10]>220);
+        // Every selected channel received the same continuous stream despite
+        // different FFT capture/transform/publication turns.
+        assert(memcmp(&rta.bass[ch],&rta.bass[0],sizeof(rta.bass[0]))==0);
     }
     uint16_t len; const uint8_t *bytes=rta_bin_frame(&len);
     const RtaBinFrameHeader *h=(const RtaBinFrameHeader *)bytes;
@@ -78,17 +87,50 @@ int main(void) {
     for (int i=0;i<300;i++) packet(false);
     matrix_mixer.outputs[0].enabled=true;
     for (int i=0;i<300;i++) packet(false);
-    RtaBandFrame f; rta_get_band_frame(0,&f); assert(f.avg[7]==0 && f.age_ms<=400);
+    RtaBandFrame f; rta_get_band_frame(0,&f); assert(f.avg[10]==0 && f.age_ms<=400);
     // Reset and rate/source/preset restart use the existing common restart hook.
     rta_restart(); rta_service();
     for (int i=0;i<300;i++) packet(false);
     for (int ch=0;ch<NUM_OUTPUT_CHANNELS;ch++) {
-        rta_get_band_frame(ch,&f); assert(f.avg[7]==0 && f.age_ms<=400);
+        rta_get_band_frame(ch,&f); assert(f.avg[10]==0 && f.age_ms<=400);
     }
     cfg.fft_order=10; assert(rta_set_config(&cfg,sizeof(cfg))); rta_service();
     for (int i=0;i<600;i++) packet(true);
-    rta_get_band_frame(0,&f); assert(f.n_bands==31 && f.avg[7]>220);
+    rta_get_band_frame(0,&f); assert(f.n_bands==34 && f.avg[10]>220);
     bytes=rta_bin_frame(&len); assert(len==16+512+1);
+    assert(caps.bass_bands==14 && caps.max_bands==37 && sizeof(f)==82);
+    // Lowest band works for all channels with the existing rotating readout.
+    tone_hz=10; rta_restart();
+    for (int i=0;i<1000;i++) packet(true);
+    for (int ch=0;ch<NUM_OUTPUT_CHANNELS;ch++) {
+        rta_get_band_frame(ch,&f); assert(f.avg[0]>=229 && f.avg[0]<=233);
+    }
+    // Changing averaging does not reset the stream; RESET_AVG does.
+    RtaBassChannel saved=rta.bass[0]; cfg.avg_ms=1000;
+    assert(rta_set_config(&cfg,sizeof(cfg)));rta_service();
+    assert(memcmp(&saved,&rta.bass[0],sizeof(saved))==0);
+    assert(rta_control(RTA_CTL_RESET_AVG));
+    rta_get_band_frame(0,&f);assert(f.age_ms==0xFFFF && f.avg[0]==0);
+    assert(rta_bass_power(&rta.bass_coeffs,&rta.bass[0],0)==0);
+    // Tap/mask change clears old output history and only feeds selected inputs.
+    cfg.tap=RTA_TAP_INPUT;cfg.channel_mask=2;cfg.avg_ms=0;
+    assert(rta_set_config(&cfg,sizeof(cfg)));rta_service();
+    for (int i=0;i<1000;i++) packet(true);
+    rta_get_band_frame(1,&f);assert(f.avg[0]>=229 && f.avg[0]<=233);
+    assert(rta_bass_power(&rta.bass_coeffs,&rta.bass[0],0)==0);
+    // STOP freezes the last readings even while audio packets continue.
+    assert(rta_control(RTA_CTL_STOP));saved=rta.bass[1];packet(true);
+    assert(memcmp(&saved,&rta.bass[1],sizeof(saved))==0);
+    rta_get_band_frame(1,&f);assert(f.avg[0]>=229 && f.avg[0]<=233);
+    assert(rta_control(RTA_CTL_START));
+    // Rate changes must discard both the filter tails and a partial FFT.
+    audio_state.freq=96000;rta_service();
+    assert(rta_bass_power(&rta.bass_coeffs,&rta.bass[1],0)==0);
+    assert(rta.bass_coeffs.decimation==16 && rta.wr==0);
+    rta_get_band_frame(1,&f);assert(f.age_ms==0xFFFF && f.n_bands==37);
+    assert(rta_control(RTA_CTL_STOP));saved=rta.bass[1];packet(true);
+    assert(memcmp(&saved,&rta.bass[1],sizeof(saved))==0);
+    rta_note_read();assert(rta.state!=RTA_STATE_IDLE);
     now+=6000000; rta_service(); rta_get_status(&st); assert(st.state==RTA_STATE_IDLE);
     return 0;
 }
@@ -101,8 +143,9 @@ with tempfile.TemporaryDirectory() as temp:
     for flt in (0, 1):
         exe = tmp / ('engine%d' % flt)
         subprocess.run(['clang','-O2','-Wall','-Wextra','-Werror',
+                        '-fsanitize=undefined','-fno-sanitize-recover=all',
                         '-DRTA_HOST','-DPICO_RP2350=%d'%flt,'-DRTA_SAMPLE_FLOAT=%d'%flt,
                         '-I'+str(tmp),'-I'+str(DSP),str(source),
-                        str(DSP/'rta_fft.c'),'-o',str(exe)],check=True)
+                        str(DSP/'rta_fft.c'),str(DSP/'rta_bass.c'),'-o',str(exe)],check=True)
         subprocess.run([str(exe)],check=True)
         print('PASS engine %s: protocol, all-channel cadence, bins, liveness, restart, off, timeout' % ('float' if flt else 'Q28'))

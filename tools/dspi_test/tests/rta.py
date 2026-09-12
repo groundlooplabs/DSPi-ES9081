@@ -21,7 +21,7 @@ from ..framework import test, Skip
 
 # --- rta.h wire constants ---------------------------------------------------
 
-RTA_CFG_VERSION = 2
+RTA_CFG_VERSION = 3
 RTA_TAP_INPUT, RTA_TAP_OUTPUT = 0, 1
 RTA_STATE_IDLE, RTA_STATE_CAPTURING, RTA_STATE_TRANSFORMING = 0, 1, 2
 RTA_CTL_STOP, RTA_CTL_START, RTA_CTL_RESET_AVG = 0, 1, 2
@@ -68,13 +68,14 @@ def _caps(dev):
         raise Skip(f"spectrum analyser not present on this firmware: {e}")
     if len(raw) < 16:
         raise Skip(f"RTA caps short ({len(raw)} B)")
-    (version, n_in, n_out, o_min, o_max, o_def, _res0, max_bands,
-     level_zero, dyn_db, idle_ms, max_bin, _resv) = struct.unpack("<10BHHH", raw)
+    (version, n_in, n_out, o_min, o_max, o_def, bass_bands, max_bands,
+     level_zero, dyn_db, idle_ms, max_bin, bass_dyn_db) = struct.unpack("<10BHHH", raw)
     if version != RTA_CFG_VERSION:
         raise Skip(f"RTA caps version {version}, harness speaks {RTA_CFG_VERSION}")
     return {"input_channels": n_in, "output_channels": n_out,
             "order_min": o_min, "order_max": o_max, "order_default": o_def,
-            "max_bands": max_bands,
+            "max_bands": max_bands, "bass_bands": bass_bands,
+            "bass_dynamic_range_db": bass_dyn_db,
             "level_zero": level_zero, "dynamic_range_db": dyn_db,
             "idle_timeout_ms": idle_ms, "max_bin_frame": max_bin}
 
@@ -93,13 +94,13 @@ def _centres(dev, caps):
 
 
 def _config(tap, mask, order, avg_ms=250, peak_db_s=20, flags=0):
-    return struct.pack("<BBHBBHBBH", RTA_CFG_VERSION, tap, mask, order, lf,
+    return struct.pack("<BBHBBHBBH", RTA_CFG_VERSION, tap, mask, order, 0,
                        avg_ms, peak_db_s, flags, 0)
 
 
 def _get_config(dev):
     raw = dev.get(OP.RTA_GET_CONFIG, 12)
-    (version, tap, mask, order, lf, avg_ms, peak, flags, _r) = struct.unpack("<BBHBBHBBH", raw)
+    (version, tap, mask, order, _reserved, avg_ms, peak, flags, _r) = struct.unpack("<BBHBBHBBH", raw)
     return {"version": version, "tap": tap, "mask": mask, "order": order,
             "avg_ms": avg_ms, "peak_decay_db_s": peak, "flags": flags}
 
@@ -107,17 +108,18 @@ def _get_config(dev):
 def _status(dev):
     raw = dev.get(OP.RTA_GET_STATUS, 24)
     (version, state, tap, fast_ch, _res0, live_count, live_mask, frames_per_s,
-     busy, last_us, idle_ms, fs, _r) = struct.unpack("<6B5H2I", raw)
+     busy, last_us, idle_ms, fs, first_band, _r, bass_busy) = struct.unpack("<6B5HIBBH", raw)
     return {"version": version, "state": state, "tap": tap,
             "fast_channel": fast_ch,
             "live_count": live_count, "live_mask": live_mask,
             "frames_per_s": frames_per_s, "busy_us_per_s": busy,
-            "last_frame_us": last_us, "idle_ms": idle_ms, "sample_rate_hz": fs}
+            "last_frame_us": last_us, "idle_ms": idle_ms, "sample_rate_hz": fs,
+            "first_band": first_band, "bass_busy_us_per_s": bass_busy}
 
 
 def _bands(dev, ch, caps):
     """One channel's RtaBandFrame, levels already decoded to dBFS."""
-    raw = dev.get(OP.RTA_GET_BANDS, 80, wvalue=ch)
+    raw = dev.get(OP.RTA_GET_BANDS, 8 + 2*caps["max_bands"], wvalue=ch)
     version, channel, seq, n_bands, age, _res = struct.unpack("<BBBBHH", raw[:8])
     nb = caps["max_bands"]
     avg = raw[8:8 + nb]
@@ -506,7 +508,9 @@ def rta_busy_within_budget(dev, profile, chk):
         chk.ok(instant < budget,
                f"last_frame_us x frames_per_s = {instant} us/s under {budget}")
         chk.note(f"busy: {st['busy_us_per_s']} us/s EMA, last frame "
-                 f"{st['last_frame_us']} us, {st['frames_per_s']} frames/s")
+                 f"{st['last_frame_us']} us, {st['frames_per_s']} frames/s; "
+                 f"bass taps: {st['bass_busy_us_per_s']} us/s summed over both cores "
+                 "(65535 means saturated; excludes packet bookkeeping)")
     finally:
         _stop_rta(dev)
         _stop_siggen(dev)

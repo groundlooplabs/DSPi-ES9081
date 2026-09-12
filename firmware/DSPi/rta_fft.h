@@ -1,7 +1,7 @@
 #pragma once
 
 // ----------------------------------------------------------------------------
-// Spectrum analyser kernel: real FFT, frequency-domain Hann, band sums, and
+// Spectrum analyser kernel: real FFT, frequency-domain Blackman-Harris, band sums, and
 // band sums.  Platform-neutral so the
 // host harness (tools/rta_test) compiles this same code natively against a
 // numpy oracle.  Protocol and engine live in rta.h / rta.c; design notes in
@@ -39,7 +39,7 @@ typedef int16_t rta_sample_t;    // Q15, full scale = +/-32767
 #define RTA_ORDER_MIN    8
 #define RTA_ORDER_MAX    10
 #define RTA_MAX_POINTS   (1u << RTA_ORDER_MAX)
-#define RTA_MAX_BANDS    36
+#define RTA_MAX_BANDS    37
 
 // Wire level byte: 0.5 dB steps, 243 = 0 dBFS, 255 = +6 dBFS, 0 = floor.
 #define RTA_LEVEL_ZERO_DBFS  243
@@ -50,7 +50,7 @@ typedef int16_t rta_sample_t;    // Q15, full scale = +/-32767
 typedef struct {
     uint32_t sample_rate_hz;
     uint8_t  order;
-    uint8_t  n_bands;          // bands valid at this rate (31 or 34)
+    uint8_t  n_bands;          // bands valid at this rate (34 or 37)
     uint8_t  reserved0;
     uint8_t  reserved;
     uint16_t lo[RTA_MAX_BANDS];
@@ -79,7 +79,7 @@ uint16_t rta_band_centre_hz(uint8_t b);
 bool rta_fft_step(rta_sample_t *buf, uint8_t order, uint8_t *stage);
 
 // ---------------------------------------------------------------------------
-// Post-transform: frequency-domain Hann, bin power, band sums, level bytes.
+// Post-transform: frequency-domain Blackman-Harris, bin power, band sums, level bytes.
 //
 // band_power: table->n_bands linear powers, normalised so a full-scale sine
 //             reads 1.0 in the band that contains it.  May be NULL.

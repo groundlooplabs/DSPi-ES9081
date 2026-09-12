@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.join(ROOT, "scripts"))
 import gen_rta_tables as G  # noqa: E402
 
 LEVEL_ZERO = 243
-MAX_BANDS = 36
+MAX_BANDS = G.MAX_BANDS
 ORDERS = tuple(range(G.ORDER_MIN, G.ORDER_MAX + 1))
 
 # Per-format limits: dynamic range floor, bin match tolerance, low-level band
@@ -134,9 +134,15 @@ def run_frame(lib, fmt, x, order, table=None):
     return bp, bins
 
 
+# 4-term Blackman-Harris, scaled so a bin-centred sine reads 0.25 like Hann.
+BH = (0.35875, 0.48829, 0.14128, 0.01168)
+BAND_NORM = 0.125272059   # sum of squared frequency-domain taps / 4
+
+
 def oracle_spectrum(x, n):
-    """Periodic-Hann DFT scaled by 1/n, matching the kernel's normalisation."""
-    w = 0.5 - 0.5 * np.cos(2.0 * np.pi * np.arange(n) / n)
+    """Periodic Blackman-Harris DFT scaled by 1/n, matching the kernel's normalisation."""
+    t = 2.0 * np.pi * np.arange(n) / n
+    w = (BH[0] - BH[1] * np.cos(t) + BH[2] * np.cos(2 * t) - BH[3] * np.cos(3 * t)) * 0.5 / BH[0]
     return np.fft.rfft(np.asarray(x[:n], dtype=np.float64) * w) / n
 
 
@@ -169,7 +175,7 @@ def pink(n, rms, seed):
 # ---------------------------------------------------------------------------
 
 def check_bins(lib, fmt, order):
-    """Bin levels against a numpy Hann FFT, above the platform floor."""
+    """Bin levels against a numpy Blackman-Harris FFT, above the platform floor."""
     n = 1 << order
     cfg = FORMATS[fmt]
     worst = 0.0
@@ -254,7 +260,7 @@ def check_pink(lib, fmt, order, fs, tbl, frames=64):
         acc += bp[:MAX_BANDS]
         s = np.abs(oracle_spectrum(quantised(blk, fmt), n)) ** 2
         for b in range(tbl.n_bands):
-            ref[b] += s[tbl.lo[b]:tbl.hi[b] + 1].sum() / 0.09375
+            ref[b] += s[tbl.lo[b]:tbl.hi[b] + 1].sum() / BAND_NORM
     acc /= frames
     ref /= frames
     # Below about a dozen bins the integer band edges are a poor fit to the
@@ -367,10 +373,10 @@ def main():
     rep.show(["fmt", "ord", "rate", "bins", "fs-bnd", "-60bnd",
               "edgepr", "edge1", "pinkfl", "pinkor", "floor", "dyn-rng"])
     print("""
-bins    worst bin level error vs numpy Hann FFT, dB      (tol 0.35 f32 / 0.75 q15)
+bins    worst bin level error vs numpy B-H FFT, dB       (tol 0.35 f32 / 0.75 q15)
 fs-bnd  full-scale sine level error in its band, dB      (tol 0.50)
 -60bnd  -60 dBFS sine level error in its band, dB        (tol 0.20 f32 / 1.25 q15;
-        spec 4.2 asks 1.00 for q15, order 10 measures 1.11, see README)
+        spec 4.2 asks 1.00 for q15, order 10 measures 1.24, see README)
 edgepr  sine on a band edge, error in the band pair, dB  (tol 0.50)
 edge1   same tone, error in the better single band, dB   (bounded by 3.01, see README)
 pinkfl  pink noise spread across bands >= 12 bins, dB    (tol 1.00)

@@ -5,7 +5,7 @@
  * audio path, is transformed in place from the main loop in bounded steps,
  * and publishes into per-channel band state and the shared bin frame.  All
  * state transitions happen on Core 0; Core 1 only ever copies samples
- * through the per-packet view.
+ * through the per-packet view and updates the bass state of its own rows.
  *
  * Design and protocol: Documentation/Features/spectrum_analyser_spec.md.
  */
@@ -34,7 +34,7 @@ rta_sample_t  rta_buf[RTA_MAX_POINTS];
 enum { PH_FILL = 0, PH_FFT = 1, PH_FINISH = 2 };
 
 typedef struct {
-    float    ema[RTA_MAX_BANDS];   // averaged band power, linear
+    float    ema[RTA_MAX_BANDS - RTA_BASS_BANDS]; // FFT-band power EMA; bass owns its EMA
     uint8_t  avg[RTA_MAX_BANDS];
     uint8_t  peak[RTA_MAX_BANDS];
     uint8_t  seq;
@@ -63,6 +63,11 @@ static struct {
     uint32_t  last_read_us;
     bool      ever_read;
     RtaChannel ch_state[RTA_MAX_TRACKED];
+    RtaBassCoeffs bass_coeffs;
+    RtaBassChannel bass[RTA_MAX_TRACKED];
+    uint16_t bass_mask;
+    uint32_t bass_busy_acc_us;
+    uint16_t bass_busy_us_per_s;
     // Bin frame: header | bins[n/2] | seq tail.
     uint8_t   bin_frame[RTA_BIN_FRAME_MAX];
     uint16_t  bin_len;             // fixed per config
@@ -90,7 +95,7 @@ static inline uint16_t tap_valid_mask(uint8_t tap) {
 
 // Selected AND live right now.  Input side follows the active USB alt and
 // the upmixer's derived rows; output side follows the matrix enables.
-static uint16_t compute_live_mask(void) {
+static uint16_t DSP_TIME_CRITICAL compute_live_mask(void) {
     uint16_t live = 0;
     if (rta.cfg.tap == RTA_TAP_INPUT) {
         uint8_t n = active_input_channel_count();
@@ -120,15 +125,6 @@ static uint8_t next_live(uint8_t cur, uint16_t mask) {
     return RTA_CH_NONE;
 }
 
-// Lowest band the table resolves (empty bands are lo > hi).  0xFF = none.
-static uint8_t table_first_band(const RtaBandTable *t) {
-    if (!t) return 0xFF;
-    for (uint8_t b = 0; b < t->n_bands; b++) {
-        if (t->lo[b] <= t->hi[b]) return b;
-    }
-    return 0xFF;
-}
-
 // Sequence numbers skip 0xFF, which marks a tail as invalid mid-write.
 static uint8_t next_seq(uint8_t s) {
     s++;
@@ -137,6 +133,8 @@ static uint8_t next_seq(uint8_t s) {
 
 static void clear_channel_state(void) {
     memset(rta.ch_state, 0, sizeof(rta.ch_state));
+    memset(rta.bass, 0, sizeof(rta.bass));
+    rta.bass_mask = 0;
 }
 
 static void start_fill(uint8_t ch) {
@@ -152,6 +150,7 @@ static void start_fill(uint8_t ch) {
 // and reads describe the applied config even while the engine is idle.
 static void derive_layout(void) {
     rta.rate_hz = (uint32_t)audio_state.freq;
+    rta_bass_configure(&rta.bass_coeffs, rta.rate_hz, rta.cfg.avg_ms);
     rta.order = rta.cfg.fft_order;
     rta.n = (uint16_t)(1u << rta.order);
     rta.table = rta_band_table(rta.rate_hz, rta.order);
@@ -179,6 +178,7 @@ static void stop_engine(void) {
     rta.live_mask = 0;
     rta_view.tap = RTA_TAP_NONE;
     rta_view.take = 0;
+    rta_view.bass_mask = 0;
     __dmb();
 }
 
@@ -202,14 +202,19 @@ static uint32_t peak_drop_steps(uint32_t *acc, uint32_t dt_us) {
 // channels share the rotation.
 static void update_band(RtaChannel *c, uint8_t b, float power, uint32_t dt_us,
                         uint32_t drop, bool first) {
-    float tau_us = (float)rta.cfg.avg_ms * 1000.0f;
-    if (first || tau_us <= 0.0f) {
-        c->ema[b] = power;
+    if (b < RTA_BASS_BANDS) {
+        c->avg[b] = rta_level_from_power(power);
     } else {
-        float a = (float)dt_us / (tau_us + (float)dt_us);
-        c->ema[b] += a * (power - c->ema[b]);
+        uint8_t index = b - RTA_BASS_BANDS;
+        float tau_us = (float)rta.cfg.avg_ms * 1000.0f;
+        if (first || tau_us <= 0.0f) {
+            c->ema[index] = power;
+        } else {
+            float a = (float)dt_us / (tau_us + (float)dt_us);
+            c->ema[index] += a * (power - c->ema[index]);
+        }
+        c->avg[b] = rta_level_from_power(c->ema[index]);
     }
-    c->avg[b] = rta_level_from_power(c->ema[b]);
 
     uint8_t inst = rta_level_from_power(power);
     if (rta.cfg.peak_decay_db_s == 0 || first) {
@@ -227,7 +232,11 @@ static void publish(const float *power) {
     bool first = !c->seen;
     uint32_t dt = first ? 0 : (now - c->t_us);
     uint32_t drop = peak_drop_steps(&c->peak_acc_us, dt);
-    for (uint8_t b = 0; b < t->n_bands; b++) update_band(c, b, power[b], dt, drop, first);
+    for (uint8_t b = 0; b < t->n_bands; b++) {
+        float p = b < RTA_BASS_BANDS
+            ? rta_bass_power(&rta.bass_coeffs, &rta.bass[rta.ch], b) : power[b];
+        update_band(c, b, p, dt, drop, first);
+    }
     c->t_us = now;
     c->seen = true;
     c->seq++;
@@ -293,11 +302,16 @@ static bool step(void) {
 }
 
 static void tick_stats(uint32_t now) {
-    if ((uint32_t)(now - rta.stat_window_us) < 1000000u) return;
+    uint32_t elapsed = now - rta.stat_window_us;
+    if (elapsed < 1000000u) return;
     rta.stat_window_us = now;
     uint32_t b = rta.busy_acc_us > 0xFFFF ? 0xFFFF : rta.busy_acc_us;
     uint32_t x = rta.busy_us_per_s;
     rta.busy_us_per_s = (uint16_t)(x - ((x + 3u) >> 2) + (b >> 2));
+    uint64_t measured = (uint64_t)rta.bass_busy_acc_us * 1000000u / elapsed;
+    uint32_t bass = measured > 0xFFFF ? 0xFFFF : (uint32_t)measured;
+    rta.bass_busy_us_per_s = (uint16_t)bass;
+    rta.bass_busy_acc_us = 0;
     rta.frames_per_s = rta.frames_acc;
     rta.busy_acc_us = 0;
     rta.frames_acc = 0;
@@ -333,6 +347,7 @@ static void apply_config(void) {
     bool restart = n.tap != rta.cfg.tap || n.channel_mask != rta.cfg.channel_mask ||
                    n.fft_order != rta.cfg.fft_order;
     rta.cfg = n;
+    rta_bass_configure(&rta.bass_coeffs, rta.rate_hz, n.avg_ms);
     if (restart) {
         bool was_running = (rta.state != RTA_STATE_IDLE);
         stop_engine();
@@ -367,6 +382,8 @@ void rta_get_caps(RtaCaps *out) {
     out->fft_order_default = 9;
     out->dynamic_range_db = 78;   // measured Q15 floor -78.5 dBFS (tools/rta_test)
 #endif
+    out->bass_bands = RTA_BASS_BANDS;
+    out->bass_dynamic_range_db = 70;
     out->max_bands = RTA_MAX_BANDS;
     out->level_zero = RTA_LEVEL_ZERO_DBFS;
     out->idle_timeout_ms = RTA_IDLE_TIMEOUT_MS;
@@ -434,7 +451,8 @@ void rta_get_status(RtaStatus *out) {
     out->last_frame_us = rta.last_frame_us;
     out->idle_ms = age_ms(now, rta.last_read_us, rta.ever_read);
     out->sample_rate_hz = rta.rate_hz;
-    out->first_band = table_first_band(rta.table);
+    out->first_band = rta.table ? 0 : 0xFF;
+    out->bass_busy_us_per_s = rta.bass_busy_us_per_s;
 }
 
 bool rta_control(uint8_t action) {
@@ -448,6 +466,7 @@ bool rta_control(uint8_t action) {
     case RTA_CTL_RESET_AVG:
         // Clear the published values too, so a read before the next publish
         // shows an empty frame rather than the pre-reset picture.
+        memset(rta.bass, 0, sizeof(rta.bass));
         for (int i = 0; i < RTA_MAX_TRACKED; i++) {
             rta.ch_state[i].seen = false;
             memset(rta.ch_state[i].avg, 0, RTA_MAX_BANDS);
@@ -479,6 +498,18 @@ void __not_in_flash_func(rta_packet_begin)(uint32_t sample_count) {
     v->tap = RTA_TAP_NONE;
     v->take = 0;
     v->produced = 0;
+    v->bass_tap = rta.cfg.tap;
+    v->bass_mask = rta.state != RTA_STATE_IDLE ? compute_live_mask() : 0;
+    // Core 0, before dispatch: reset channels that disappear or return.
+    uint16_t changed = rta.state != RTA_STATE_IDLE ? v->bass_mask ^ rta.bass_mask : 0;
+    for (int ch = 0; ch < RTA_MAX_TRACKED; ch++) {
+        v->bass_busy_us[ch] = 0;
+        if (changed & (1u << ch)) {
+            memset(&rta.bass[ch], 0, sizeof(rta.bass[ch]));
+            memset(&rta.ch_state[ch], 0, sizeof(rta.ch_state[ch]));
+        }
+    }
+    rta.bass_mask = v->bass_mask;
     if (rta.state == RTA_STATE_CAPTURING && rta.phase == PH_FILL) {
         uint32_t room = rta.n - rta.wr;
         v->take = (uint16_t)(sample_count < room ? sample_count : room);
@@ -493,6 +524,9 @@ void __not_in_flash_func(rta_packet_end)(uint32_t sample_count) {
     (void)sample_count;
     __dmb();
     RtaPacketView *v = &rta_view;
+    for (int ch = 0; ch < RTA_MAX_TRACKED; ch++)
+        rta.bass_busy_acc_us += v->bass_busy_us[ch];
+    v->bass_mask = 0;
     // Advance by what the tap actually copied, never by what was offered: a
     // row that was not tapped this packet leaves the count at 0.
     if (v->tap != RTA_TAP_NONE && v->produced) {
@@ -504,8 +538,12 @@ void __not_in_flash_func(rta_packet_end)(uint32_t sample_count) {
 }
 
 void DSP_TIME_CRITICAL rta_tap(uint8_t tap, uint8_t row, const rta_pipe_t *buf, uint32_t n) {
-    (void)n;
     RtaPacketView *v = &rta_view;
+    if (v->bass_tap == tap && row < RTA_MAX_TRACKED && (v->bass_mask & (1u << row))) {
+        uint32_t start = time_us_32();
+        rta_bass_push(&rta.bass_coeffs, &rta.bass[row], buf, n);
+        v->bass_busy_us[row] = time_us_32() - start;
+    }
     if (v->tap != tap || v->row != row || !v->take) return;
     uint32_t take = v->take;
     rta_sample_t *dst = &rta_buf[v->wr];

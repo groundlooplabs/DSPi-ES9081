@@ -76,6 +76,9 @@ add_executable(DSPi
     subharm.h
     siggen.c
     siggen.h
+    rta_bass.c
+    rta_bass.h
+    rta_bass_tables.h
     rta.c
     rta.h
     rta_fft.c

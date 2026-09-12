@@ -6,9 +6,9 @@
  * One FFT engine, pointed at any set of channels on the input side (after
  * the per-input PEQ) or the output side (after gain and delay, exactly what
  * the slots transmit).  The audio path only copies the current channel's
- * samples into a capture buffer; the transform runs from the main loop in
- * bounded steps.  Channels are visited in rotation, so the CPU cost is the
- * same for one channel or all of them.
+ * samples into a capture buffer and continuously updates the selected bass
+ * banks; the transform runs from the main loop in
+ * bounded steps.  FFT frames are visited in rotation; bass CPU scales with selected channels.
  *
  * Transient: off at boot, never persisted, stops itself when nobody reads.
  * See Documentation/Features/spectrum_analyser_spec.md for the protocol.
@@ -18,12 +18,13 @@
 #include <stdbool.h>
 #include "config.h"
 #include "rta_fft.h"
+#include "rta_bass.h"
 
 // ---------------------------------------------------------------------------
 // Protocol constants
 // ---------------------------------------------------------------------------
 
-#define RTA_CFG_VERSION       2
+#define RTA_CFG_VERSION       3
 #define RTA_IDLE_TIMEOUT_MS   5000
 
 #define RTA_TAP_INPUT   0     // after per-input PEQ, before the matrix
@@ -61,7 +62,7 @@ typedef struct __attribute__((packed)) {
     uint16_t channel_mask;     // bit i = channel i at that tap; 0 = STALL
     uint8_t  fft_order;        // RTA_ORDER_MIN..RTA_ORDER_MAX
     uint8_t  reserved0;
-    uint16_t avg_ms;           // power-domain EMA time constant, 0 = none
+    uint16_t avg_ms;           // EMA ms; 0 disables extra averaging (bass retains detector smoothing)
     uint8_t  peak_decay_db_s;  // 0 = peak hold off
     uint8_t  flags;            // RTA_FLAG_*
     uint16_t reserved;
@@ -75,13 +76,13 @@ typedef struct __attribute__((packed)) {
     uint8_t  fft_order_min;
     uint8_t  fft_order_max;
     uint8_t  fft_order_default;
-    uint8_t  reserved0;
+    uint8_t  bass_bands;       // continuous bands, starting at index 0
     uint8_t  max_bands;
     uint8_t  level_zero;       // RTA_LEVEL_ZERO_DBFS
     uint8_t  dynamic_range_db;
     uint16_t idle_timeout_ms;
     uint16_t max_bin_frame;
-    uint16_t reserved;
+    uint16_t bass_dynamic_range_db; // conservative usable bass range, both formats
 } RtaCaps;
 _Static_assert(sizeof(RtaCaps) == 16, "RtaCaps wire size");
 
@@ -95,7 +96,7 @@ typedef struct __attribute__((packed)) {
     uint8_t  avg[RTA_MAX_BANDS];
     uint8_t  peak[RTA_MAX_BANDS];
 } RtaBandFrame;
-_Static_assert(sizeof(RtaBandFrame) == 80, "RtaBandFrame wire size");
+_Static_assert(sizeof(RtaBandFrame) == 82, "RtaBandFrame wire size");
 
 typedef struct __attribute__((packed)) {
     uint8_t  version;
@@ -121,9 +122,9 @@ typedef struct __attribute__((packed)) {
     uint16_t last_frame_us;    // wall time of the last complete transform
     uint16_t idle_ms;          // since the last data read; 0xFFFF = never
     uint32_t sample_rate_hz;
-    uint8_t  first_band;       // lowest band resolved at this size and rate
+    uint8_t  first_band;       // 0 with supported bass bank, 0xFF for unsupported rate
     uint8_t  reserved1;
-    uint16_t reserved2;
+    uint16_t bass_busy_us_per_s; // summed tap time on both cores; saturates at 65535
 } RtaStatus;
 _Static_assert(sizeof(RtaStatus) == 24, "RtaStatus wire size");
 
@@ -172,6 +173,9 @@ typedef struct {
     uint16_t wr;
     uint16_t take;             // samples to copy this packet, 0 = none
     volatile uint16_t produced;
+    uint8_t bass_tap;
+    uint16_t bass_mask;
+    volatile uint32_t bass_busy_us[RTA_MAX_TRACKED];
 } RtaPacketView;
 
 extern RtaPacketView rta_view;

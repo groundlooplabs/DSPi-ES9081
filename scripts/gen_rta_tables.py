@@ -21,7 +21,7 @@ import sys
 # Must match RTA_ORDER_MIN / RTA_ORDER_MAX in rta_fft.h.
 ORDER_MIN = 8
 ORDER_MAX = 10
-MAX_BANDS = 36
+MAX_BANDS = 37
 
 # Device sample rates the analyser supports.
 RATES = (44100, 48000, 96000)
@@ -31,13 +31,13 @@ RATES = (44100, 48000, 96000)
 TW_N = 1 << (ORDER_MAX - 1)
 SPLIT_N = (1 << ORDER_MAX) // 4 + 1
 
-# IEC 61260 base-10 third-octave: fc = 1000 * 10^(i/10).  Band 0 is the 20 Hz
-# band, so band b has i = b - 17 (10^-1.7 * 1000 = 19.953 Hz).
-BAND_I0 = -17
+# IEC 61260 base-10 third-octave: fc = 1000 * 10^(i/10).  Band 0 is the 10 Hz
+# band, so band b has i = b - 20 (10^-2 * 1000 = 10 Hz).
+BAND_I0 = -20
 
-# Nominal (displayed) centres, R10 preferred numbers.  Band 2 is 31.5 Hz and is
+# Nominal (displayed) centres, R10 preferred numbers.  Band 5 is 31.5 Hz and is
 # carried as 32 because the caps field is whole Hz.
-NOMINAL_HZ = (20, 25, 32, 40, 50, 63, 80, 100, 125, 160, 200, 250, 315, 400,
+NOMINAL_HZ = (10, 13, 16, 20, 25, 32, 40, 50, 63, 80, 100, 125, 160, 200, 250, 315, 400,
               500, 630, 800, 1000, 1250, 1600, 2000, 2500, 3150, 4000, 5000,
               6300, 8000, 10000, 12500, 16000, 20000, 25000, 31500, 40000)
 
@@ -52,8 +52,8 @@ def band_edges(b):
 
 
 def band_count(sample_rate_hz):
-    """31 bands to 20 kHz below 50 kHz, 34 bands to 40 kHz above."""
-    return 34 if sample_rate_hz > 50000 else 31
+    """34 bands to 20 kHz below 50 kHz, 37 bands to 40 kHz above."""
+    return 37 if sample_rate_hz > 50000 else 34
 
 
 def band_bins(sample_rate_hz, order, n_bands):

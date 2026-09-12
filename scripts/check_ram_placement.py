@@ -120,6 +120,7 @@ COMMON = [
     ("rta_packet_begin", False),
     ("rta_packet_end", False),
     ("rta_tap", False),
+    ("rta_bass_push", False),
     ("osc_sin", True),
     ("blep", True),
     ("synth_sine", True),

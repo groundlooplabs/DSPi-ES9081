@@ -4,9 +4,10 @@
 # stable entry point with a numpy check in front of it.
 set -e
 cd "$(dirname "$0")"
-python3 -c "import numpy" 2>/dev/null || {
-    echo "error: numpy is required (pip3 install numpy)" >&2
+python3 -c "import numpy, scipy" 2>/dev/null || {
+    echo "error: numpy and scipy are required (pip3 install numpy scipy)" >&2
     exit 1
 }
 python3 test_rta.py "$@"
-exec python3 test_engine.py
+python3 test_engine.py
+exec python3 test_bass.py

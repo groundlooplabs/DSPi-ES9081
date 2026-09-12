@@ -147,7 +147,7 @@ extern volatile uint32_t nominal_feedback_10_14;
 #define REQ_RTA_SET_CONFIG          0x08  // 12-byte RtaConfig; STALL on invalid
 #define REQ_RTA_GET_CONFIG          0x09  // returns RtaConfig (12 B)
 #define REQ_RTA_GET_CAPS            0x0A  // wValue 0 = RtaCaps (16 B); 1.. = band centre chunks
-#define REQ_RTA_GET_BANDS           0x0B  // wValue = channel; returns RtaBandFrame (80 B)
+#define REQ_RTA_GET_BANDS           0x0B  // wValue = channel; returns RtaBandFrame (82 B)
 #define REQ_RTA_GET_BINS            0x0C  // wValue = byte offset into the bin frame
 #define REQ_RTA_GET_STATUS          0x0D  // returns RtaStatus (24 B)
 #define REQ_RTA_CONTROL             0x0E  // wValue = RTA_CTL_*; returns 1 byte

@@ -1,13 +1,13 @@
 # Spectrum Analyser (RTA / FFT) Specification
 
 *Status: implemented, hardware-untested*
-*Last updated: 2026-09-12 (protocol V2, single transform up to 1024 points)*
+*Last updated: 2026-09-12 (Blackman-Harris FFT window; sixth-order bass bands; protocol V3, continuous 10–200 Hz bass bank plus FFT up to 1024 points)*
 
 ## 1. Overview
 
 The onboard **spectrum analyser** ("RTA") is a single FFT engine that can be
 pointed at any set of channels on either side of the processing chain. It
-produces two products from every frame: a third-octave **band table** small
+produces two products from every frame: a hybrid third-octave **band table** small
 enough for any transport, and the **raw magnitude bins** for the Console's
 FFT view. It exists so that S/PDIF, ADAT, and I2S inputs, every output, and
 non-USB clients (the ESP32 front panel, control-surface OLEDs, UART and I2C
@@ -19,14 +19,12 @@ samples and can transform them itself.
 - **One engine, selectable tap.** The tap is either the input side (after the
   per-input PEQ, before the matrix) or the output side (after gain and delay,
   before encoding, which is exactly what the slot transmits).
-- **Any set of channels at constant CPU.** The engine transforms one channel
-  per frame and rotates through the selected set, keeping the latest result
-  for each. Selecting more channels never adds CPU. It only lengthens the
-  interval between refreshes of any one channel.
-- **Out of the audio path.** The audio callback copies the current channel's
-  samples into a capture buffer and nothing else. The transform runs in the
-  main loop as background work, split into bounded steps, so audio always
-  wins and a busy device slows the analyser rather than the audio.
+- **Any set of channels.** One FFT rotates through the selected channels at
+  constant aggregate transform cost. Each selected channel also has a continuous
+  bass filter bank: its small CPU cost scales with selected channel count.
+- **Bounded audio work.** The callback copies the current FFT channel and updates
+  the selected bass banks. FFT work remains resumable in the main loop. Bass work
+  is synchronous audio work and must fit the packet deadline on hardware.
 - **Alignment-neutral by construction.** The tap is read-only and changes no
   sample count, so it cannot move any output slot relative to another.
 - **Small.** The transform runs in place in the capture buffer, and every
@@ -36,7 +34,7 @@ samples and can transform them itself.
 - **Transient only.** Never persisted, off at boot, not part of presets or the
   bulk-params blob, and it switches itself off when nobody is reading it.
 - **Platform parity.** Identical wire protocol on both platforms. RP2350 uses a
-  float kernel, RP2040 a Q15 kernel with a lower noise floor.
+  float kernel, RP2040 a Q15 kernel with a higher numerical noise floor. The bass bank uses float on RP2350 and Q27 states/Q28 coefficients with 64-bit accumulators on RP2040.
 
 ### Signal-chain position
 
@@ -61,28 +59,28 @@ never reads a row that has already been converted while ADAT is active.
 
 ### 2.1 Band table
 
-Third-octave bands with IEC 61260 nominal centres from 20 Hz upward. The band
+Third-octave bands with IEC 61260 nominal centres from 10 Hz upward. The band
 count depends on the sample rate:
 
 | Sample rate | Bands | Top band centre |
 |-------------|-------|-----------------|
-| 44.1 kHz | 31 | 20 kHz |
-| 48 kHz | 31 | 20 kHz |
-| 96 kHz | 34 | 40 kHz |
+| 44.1 kHz | 34 | 20 kHz |
+| 48 kHz | 34 | 20 kHz |
+| 96 kHz | 37 | 40 kHz |
 
-`RTA_MAX_BANDS` is 36. A band's level is the sum of the windowed bin powers
+`RTA_MAX_BANDS` is 37. Above 200 Hz, a band's level is the sum of the windowed bin powers
 inside the band's edges, normalised so that a full-scale sine reads 0 dBFS in
 the band that contains it. Pink noise therefore reads flat across bands, and
 white noise rises 3 dB per octave, which is standard RTA behaviour.
 
-The DC bin belongs to no band. A band that contains no bin at the current
+The following FFT resolution rules apply above the bass bank; its 14 bands are always populated at supported rates. The DC bin belongs to no band. A band that contains no bin at the current
 size and rate is **empty** and reads the floor (0); it is never faked from a
-neighbouring bin. `RtaStatus.first_band` reports the lowest band the current
-size resolves, so a display can grey out the rest. A band that holds only one
-or two bins captures only part of a tone's Hann main lobe and reads a centred
-tone up to 1.76 dB low; wideband levels are unaffected.
+neighbouring bin. `RtaStatus.first_band` is 0 for supported layouts because the bass bank reaches 10 Hz. Clients must still use the FFT geometry to identify empty bands above 200 Hz at small FFT sizes/high sample rates. A band that holds only one
+or two bins captures only part of a tone's window main lobe and reads a centred
+tone up to 3.02 dB low (one bin) or 0.84 dB low (two bins); wideband levels are
+unaffected.
 
-Lowest resolved band per size, at 48 kHz:
+Lowest FFT bin-containing band per size, at 48 kHz (raw FFT only):
 
 | Points | Bin width | First resolved band | Frame time |
 |--------|-----------|---------------------|------------|
@@ -90,14 +88,54 @@ Lowest resolved band per size, at 48 kHz:
 | 512 | 93.75 Hz | 100 Hz | 11 ms |
 | 1024 | 46.9 Hz | 50 Hz | 21 ms |
 
-At 44.1 kHz each size resolves one band lower; at 96 kHz one octave (three
-bands) higher. 1024 points is the ceiling: 2048 would resolve down to 25 Hz
-but costs another 4.6 KB of RAM on RP2350, and resolving the 20 Hz band would
-need 16384 points. A decimated bass stream was built and rejected in favour of
-this simpler single-transform design.
+At 44.1 kHz each FFT size reaches one band lower; at 96 kHz one octave
+higher. The 1024-point ceiling and its buffer are unchanged. Bass band levels
+come from the separate continuous bank described below, not from interpolated
+or zero-padded FFT bins.
+
+### 2.1.1 Continuous bass bank
+
+Fourteen bands use exact base-10 centres 10 Hz through 199.526 Hz. The nominal
+caps table starts `10, 13, 16, 20, 25, 32, ...`; the whole-Hz wire format rounds
+12.589 and 31.623 Hz to 13 and 32. Each selected/live channel is fed on every
+packet, including FFT/FINISH phases and other channels' capture turns.
+
+The analyzer-only branch is CIC3 decimation by 8 at 44.1/48 kHz or 16 at
+96 kHz, an eighth-order elliptic low-pass (225 Hz pass edge, 0.1 dB ripple,
+85 dB stop specification), then decimation by 8. Final rate is 689.0625 or
+750 Hz. The CIC uses defined unsigned 32-bit modular accumulators on both
+platforms; input quantisation is Q18 at 44.1/48 kHz, Q15 at 96 kHz, clipped at
++/-4 FS. Prefix gain normalisation of the four low-pass sections prevents
+internal fixed-point overload. Coefficients are generated by
+`scripts/gen_rta_bass.py` and copied to RAM before streaming.
+
+Each band is a sixth-order Butterworth bandpass (three `b0*(1 - z^-2)`
+sections, lowest-Q first, every cascade prefix normalised to at most unity
+peak gain) followed by a continuous power EMA. A single biquad per band was
+rejected because its 6 dB/octave skirts made one bass tone light every band
+in the bank.
+The EMA time constant is the longer of one centre-frequency period and
+`avg_ms`. It directly supplies the published average, avoiding duplicate state
+and a second averaging delay. Peak hold remains updated at each channel's FFT
+publication cadence. Per-centre power correction compensates decimator and bandpass gain.
+The fixed detector uses Q48 power in a 64-bit word and clamps detection above
++12 dBFS; float uses a float power state. `RESET_AVG` clears filter history too.
+
+At `avg_ms=0`, host tests measure 90% power response in 590 ms at 10 Hz,
+300 ms at 19.953 Hz, and 50 ms at 199.526 Hz. Publication adds up to a normal
+FFT rotation interval; it does not multiply the filter settling time by the
+number of channels. Larger `avg_ms` deliberately slows response.
+
+These are **tone-calibrated RTA bands**, not certified IEC 61260 measurement
+filters or additional raw FFT bins. Host tests require a tone to read at least
+40 dB down one octave from its band and 60 dB down two octaves away (measured
+worst case 42.4 dB at one octave). Adjacent bands still cross about 18 dB down
+at the neighbouring centre. Numerical frequency-response integration predicts
+pink-noise levels 0.1–0.2 dB above ideal disjoint third-octave integration. `bass_dynamic_range_db=70` is a conservative separate capability; the
+FFT's 78/120 dB capability does not describe the bass path.
 
 Two arrays are kept per channel: the **averaged** level and the **peak-hold**
-level. Averaging is an exponential moving average in the power domain (not the
+level. Above 200 Hz, averaging is an exponential moving average in the power domain (not the
 dB domain, which under-reads noise by up to 2.5 dB in single-bin bands). Its
 coefficient is derived from `avg_ms` and the channel's actual refresh interval
 so the time constant stays in real time regardless of how many channels share
@@ -186,7 +224,7 @@ crossfeed, and subharm snapshots in `Core1EqWork`, just in its own struct.
 
 Only the core that owns the row copies samples this packet, and it copies to
 the snapshotted index. It writes back one field, `produced`, which Core 0
-reads in `rta_packet_end()` after the `work_done` join. Core 0 alone advances
+reads in `rta_packet_end()` after the `work_done` join. Each owning core additionally updates its own bass channel state and per-packet timing slot, selected by a snapshotted bass mask. Core 0 clears channels entering/leaving the mask before dispatch and reads bank powers/timings only after the existing join. Core 0 alone advances
 the index and changes phase, so the two cores never touch the same
 bookkeeping. The capture buffer is written by at most one core per packet and
 read by the main loop only after the fill completes, so no lock is needed
@@ -199,13 +237,30 @@ pre-empt each other.
 
 ### 3.4 Window, power, and normalisation
 
-The window is Hann, applied in the frequency domain after the transform:
+The window is the 4-term minimum Blackman-Harris (0.35875, 0.48829, 0.14128,
+0.01168), applied in the frequency domain after the transform and scaled to a
+0.5 centre tap:
 
 ```
-Xw[k] = 0.5 * X[k] - 0.25 * (X[k-1] + X[k+1])
+Xw[k] = 0.5 * X[k] - 0.340271777 * (X[k-1] + X[k+1])
+      + 0.098452962 * (X[k-2] + X[k+2]) - 0.008139373 * (X[k-3] + X[k+3])
 ```
 
-This removes the per-sample multiply and the window table. Powers are summed
+Q15 uses taps 16384, 11150, 3226 and 267. Bins past DC and Nyquist come from
+conjugate symmetry. The scaling keeps the Hann-era bin normalisation (a
+bin-centred full-scale sine reads 0 dBFS). Band sums divide by 0.125272059,
+the sum of squared taps over 4.
+
+Hann was replaced because its sidelobes fall away slowly. With the bass bank
+reading 70-90 dB down around 200 Hz, a loud 20-100 Hz tone leaked into the
+first FFT bands at -40 to -55 dB and drew a fixed hump whose position moved
+with FFT size. Engine simulation at 1024 points now puts that leakage at
+-98 dB or lower in float. The cost is a wider main lobe. At 512 and 256 points
+the lowest FFT band sits within two or three bins of loud bass and reads it
+higher than Hann did; bands from 500 Hz up are clean at 512 points.
+
+Applying the window after the transform removes the per-sample multiply and
+the window table. Powers are summed
 per band in the linear domain and converted to dB once per band; the bin
 product converts once per bin using a fast log2 on the float exponent (RP2350)
 or a leading-zero count (RP2040).
@@ -244,7 +299,7 @@ host-side test harness. Both platforms implement the same interface:
 //   returns true when the last stage has completed.
 bool rta_fft_step(rta_sample_t *buf, uint8_t order, uint8_t *stage);
 
-// Frequency-domain Hann, bin power, band sums and bin magnitudes.
+// Frequency-domain Blackman-Harris, bin power, band sums and bin magnitudes.
 // bands[]/bins[] receive RTA level bytes (section 2.3).
 void rta_fft_finish(const rta_sample_t *buf, uint8_t order,
                     const RtaBandTable *table, float *band_power,
@@ -277,16 +332,17 @@ Compiled natively with clang and driven from Python (`tools/rta_test/run.sh`),
 for every order and both sample formats:
 
 - A full-scale sine at any frequency reads 0 dBFS within 0.5 dB in the band
-  that contains it. On a band edge the Hann main lobe splits across two bands:
+  that contains it. On a band edge the window main lobe splits across two bands:
   the pair sums to 0 dBFS within 0.5 dB and the better single band never falls
   below -3.05 dB.
 - A sine at -60 dBFS reads within 0.2 dB (RP2350) or 1.25 dB (RP2040; 1.5 dB
   where the band sums more of the Q15 floor). The measured worst case is
-  1.11 dB at 1024 points.
+  1.24 dB at 1024 points, 0.01 dB inside the tolerance; the wider window sums
+  more Q15 floor than Hann's 1.11 dB.
 - With a -100 dBFS sine, every bin more than three bins away reads below the
   platform's dynamic-range floor.
 - Pink noise reads flat across bands within 1 dB after averaging 64 frames.
-- Bin magnitudes match a numpy Hann FFT of the same input within 0.35 dB
+- Bin magnitudes match a numpy Blackman-Harris FFT of the same input within 0.35 dB
   (RP2350) or 0.75 dB (RP2040) above the floor.
 
 `tools/rta_test/test_engine.py` additionally compiles the real engine against
@@ -305,7 +361,7 @@ Vendor commands 0x08 to 0x0F. All GETs are `bmRequestType` 0xC1, all SETs
 | 0x08 | `REQ_RTA_SET_CONFIG` | SET | 0 | `RtaConfig` (12 B). STALL on invalid |
 | 0x09 | `REQ_RTA_GET_CONFIG` | GET | 0 | `RtaConfig` (12 B) applied config |
 | 0x0A | `REQ_RTA_GET_CAPS` | GET | 0 | `RtaCaps` (16 B); 1..n = band centre table chunk |
-| 0x0B | `REQ_RTA_GET_BANDS` | GET | channel | `RtaBandFrame` (80 B) for that channel at the current tap |
+| 0x0B | `REQ_RTA_GET_BANDS` | GET | channel | `RtaBandFrame` (82 B) for that channel at the current tap |
 | 0x0C | `REQ_RTA_GET_BINS` | GET | byte offset | chunk of the bin frame, `wLength` bytes |
 | 0x0D | `REQ_RTA_GET_STATUS` | GET | 0 | `RtaStatus` (24 B) |
 | 0x0E | `REQ_RTA_CONTROL` | GET | action | one status byte, like `REQ_SIGGEN_CONTROL`. `RTA_CTL_*` |
@@ -326,13 +382,13 @@ host that reads several chunks validates that both match and re-reads if the
 frame turned over in between. The engine clears the tail to 0xFF before it
 writes and sets it last; sequence numbers skip 0xFF. The layout is fixed for
 the life of a config. No lock is taken. The bin frame is never larger than
-1,041 bytes.
+529 bytes.
 
 ### 5.2 Structures
 
 ```c
-#define RTA_CFG_VERSION      2
-#define RTA_MAX_BANDS        36
+#define RTA_CFG_VERSION      3
+#define RTA_MAX_BANDS        37
 #define RTA_LEVEL_ZERO_DBFS  243
 
 #define RTA_TAP_INPUT   0     // after per-input PEQ, before matrix
@@ -359,13 +415,13 @@ typedef struct __attribute__((packed)) {
     uint8_t  fft_order_min;    // 8
     uint8_t  fft_order_max;    // 10
     uint8_t  fft_order_default;// 10 on RP2350, 9 on RP2040
-    uint8_t  reserved0;
+    uint8_t  bass_bands;       // 14 continuous bands from index 0
     uint8_t  max_bands;        // RTA_MAX_BANDS
     uint8_t  level_zero;       // RTA_LEVEL_ZERO_DBFS
     uint8_t  dynamic_range_db; // 78 on RP2040 (measured), 120 on RP2350
     uint16_t idle_timeout_ms;  // RTA_IDLE_TIMEOUT_MS
     uint16_t max_bin_frame;    // largest bin frame in bytes (529)
-    uint16_t reserved;
+    uint16_t bass_dynamic_range_db; // 70, independent of FFT dynamic_range_db
 } RtaCaps;                     // 16 bytes
 
 // GET_CAPS wValue 1..: uint16 band centre frequencies in Hz, 32 per chunk.
@@ -379,7 +435,7 @@ typedef struct __attribute__((packed)) {
     uint16_t reserved;
     uint8_t  avg[RTA_MAX_BANDS];
     uint8_t  peak[RTA_MAX_BANDS];
-} RtaBandFrame;                // 80 bytes
+} RtaBandFrame;                // 82 bytes
 
 typedef struct __attribute__((packed)) {
     uint8_t  version;
@@ -409,9 +465,9 @@ typedef struct __attribute__((packed)) {
     uint16_t last_frame_us;    // wall time of the last complete transform, for the bench
     uint16_t idle_ms;          // since the last data read; 0xFFFF = never
     uint32_t sample_rate_hz;
-    uint8_t  first_band;       // lowest band resolved at this size and rate
+    uint8_t  first_band;       // 0 for supported bass layouts, else 0xFF
     uint8_t  reserved1;
-    uint16_t reserved2;
+    uint16_t bass_busy_us_per_s; // summed bass tap time, saturates at 65535
 } RtaStatus;                   // 24 bytes
 
 #define RTA_CTL_STOP       0
@@ -420,7 +476,21 @@ typedef struct __attribute__((packed)) {
 ```
 
 `busy_us_per_s` exists because the existing CPU load figure measures only the
-packet callback and cannot see main-loop work.
+packet callback and cannot see main-loop work. `bass_busy_us_per_s` separately
+reports summed elapsed microseconds spent inside bass tap calls on both cores
+normalised to one second from the last statistics window, saturating at 65535.
+It excludes packet bookkeeping, and includes interrupt/preemption time during
+those calls; it is not a cycle counter. The audio CPU meters also include this
+work, so do not add the bass figure to them again. 10,000 us/s equals 1% of one
+core's available time. Hardware CPU/deadline and output-alignment tests remain
+required before release.
+
+V3 is deliberately incompatible with V2 config/frame interpretation. Config,
+caps, status and bin-header sizes stay 12/16/24/16 bytes; band frames grow from
+80 to 82 bytes and their indices shift by three. Read `max_bands` and the centre
+table, and reject unsupported versions. GET_BANDS_ALL uses 82-byte strides.
+No command IDs were added. The separate Console repository needs a matching V3
+client update; this firmware repository contains only the device test client.
 
 ### 5.3 Validation
 
@@ -433,42 +503,37 @@ size restarts the frame (section 3.5). A change of `avg_ms`,
 
 ## 6. Cost
 
-### 6.1 RAM (static, BSS), measured against HEAD
+### 6.1 RAM
 
-| Item | RP2350 | RP2040 |
-|------|--------|--------|
-| Capture buffer, 1024 points | 4,096 B | 2,048 B |
-| Bin frame (header + 512 + tail) | 529 B | 529 B |
-| Per-channel band state: 9 (RP2350) / 5 (RP2040) channels | 2,052 B | 1,140 B |
-| Engine state, config, staged config, statistics, response staging | ~170 B | ~170 B |
-| **Total BSS** | **6,848 B (~6.7 KB)** | **3,888 B (~3.8 KB)** |
-| RAM image (RAM-pinned tap and packet bookkeeping) | ~0.3 KB | ~0.2 KB |
+The 1024-point capture buffer stays 4,096 B on RP2350 / 2,048 B on RP2040;
+the raw-bin frame stays 529 B. The shared bass coefficient block is 364 B.
+Each bass channel is 228 B float or 288 B fixed (wider power state), while
+removing the 14 duplicated float EMA states saves 56 B per channel.
 
-The capture buffer is sized for the largest order whatever the applied
-config, which is why the ceiling is 1024 rather than 2048. If RAM ever gets
-tight it fits inside the idle 8 KB `bulk_param_buf`, which already has a
-claim-and-release lock shared by every transport; that overlay is a follow-up,
-not part of this spec.
+Measured BSS increase over the preceding single-FFT firmware: **2,000 B
+RP2350 / 1,580 B RP2040**, including the V3 band/frame changes and timing state.
+Total analyzer BSS is consequently about 8.6 KB / 5.3 KB. RAM-resident bass
+code is additional to BSS; use `scripts/check_ram_placement.py` for total RAM
+accounting and the hot-call closure. No audio buffers, delay lines, output
+slots, or pipeline reset sequencing are changed.
 
 ### 6.2 CPU
 
-| Configuration | RP2350 | RP2040 |
-|---------------|--------|--------|
-| 1024 points (RP2350 default) | < 0.5% of Core 0 | ~1.7% (about 110k cycles per frame, measured on the host) |
-| 512 points (RP2040 default) | < 0.5% | ~1% |
-| Tap copy in the audio callback | a few µs per block | a few µs per block |
-
-Everything here runs in the main loop, so an over-budget frame shows up as a
-slower refresh, never as an audio fault. The bench figure via
-`RtaStatus.last_frame_us` is still pending; on RP2040 the `FINISH` step (a
-libgcc count-leading-zeros call per bin) is the item most likely to exceed
-the 250 µs step guideline at 1024 points.
+FFT throughput still shares one engine. Bass cost scales with selected/live
+channels: at 48/96 kHz each channel executes 144,000 CIC integrator additions
+at 48 kHz (288,000 at 96 kHz), 24,000 low-pass biquad updates and 10,500 bass
+biquad/detector updates per second. Input conversion, comb differences and
+bookkeeping are additional. RP2040 uses 64-bit fixed-point intermediates at
+the decimated rates; RP2350 uses float there. No on-device CPU percentage is
+claimed from host tests. Check both `busy_us_per_s` and
+`bass_busy_us_per_s`, plus the existing audio CPU/deadline metrics, on hardware.
+Unlike the background FFT, bass filtering is synchronous audio work.
 
 ### 6.3 Flash
 
 Twiddle and band tables: about 7.5 KB on RP2350 and 4.5 KB on RP2040. Kernel,
 engine, and handler code: about 6 KB. The tap and the packet begin/end
-bookkeeping are `DSP_TIME_CRITICAL`, because they run inside the meter loops
+bookkeeping, live-mask helper and bass streaming kernel are `DSP_TIME_CRITICAL`, because they run inside the meter loops
 on both cores during flash writes. The transform, the band sums, and all
 control paths stay in flash.
 
@@ -479,6 +544,8 @@ control paths stay in flash.
 | `firmware/DSPi/rta.h`, `rta.c` | engine: state machine, rotation, tap, publish, averaging, service, auto-off, wire helpers |
 | `firmware/DSPi/rta_fft.h`, `rta_fft.c` | kernel: FFT, split, window/power/bands (both platforms) |
 | `firmware/DSPi/rta_tables.h` | generated twiddles and band tables |
+| `firmware/DSPi/rta_bass.c`, `rta_bass.h`, `rta_bass_tables.h` | continuous bass bank, state, generated decimator/resonator coefficients |
+| `scripts/gen_rta_bass.py` | SciPy bass coefficient generator |
 | `scripts/gen_rta_tables.py` | table generator, single source of truth for band layout |
 | `tools/rta_test/` | host harness: numpy oracle for the kernel, stubbed engine smoke test |
 | `tools/dspi_test/tests/rta.py` | device tests (section 8) |
@@ -495,7 +562,7 @@ Using the signal generator on the output tap and USB playback on the input tap:
 
 - A 1 kHz sine at -20 dBFS on one output reads -20 dBFS within 1 dB in the
   1 kHz band of that output and below -60 dBFS in every band two or more away.
-- Pink noise on all outputs reads flat within 2 dB across resolved bands after
+- Pink noise on all outputs reads flat within 2 dB across resolved FFT bands after
   2 s of averaging, on every selected channel.
 - With all outputs selected, `seq` advances on every one of them and `age_ms`
   never exceeds 1.5x the expected rotation interval.

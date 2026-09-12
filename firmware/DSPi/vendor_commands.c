@@ -1911,7 +1911,7 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
     {
         // Device -> Host (GET requests)
         static uint8_t resp_buf[64];
-        // RTA staging: RtaBandFrame (80 B) does not fit resp_buf, and the
+        // RTA staging: RtaBandFrame (82 B) does not fit resp_buf, and the
         // caps band-centre chunk is 64 B.  Static, so USB sends from it.
         static uint8_t rta_resp_buf[sizeof(RtaBandFrame)];
         _Static_assert(sizeof(rta_resp_buf) >= 64, "RTA caps chunk staging");
@@ -4189,7 +4189,7 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
 
             // ---- Spectrum analyser (RTA / FFT), 0x08-0x0F ----
             // Responses are staged in rta_resp_buf because RtaBandFrame is
-            // 80 bytes, past the 64-byte resp_buf above.
+            // 82 bytes, past the 64-byte resp_buf above.
             case REQ_RTA_GET_CONFIG: {
                 RtaConfig cfg;
                 rta_get_config(&cfg);

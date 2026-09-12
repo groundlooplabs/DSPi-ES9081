@@ -1947,7 +1947,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 ---
 
 ## RP2040 vs RP2350 Comparison
-*Last updated: 2026-09-12 (spectrum analyser row: FFT ceiling lowered to 1024 points, RAM cost revised; 2026-09-07: LF FFT replaced by continuous bank, protocol V2 and RAM cost; 2026-09-04: subharm row: new parameters and per-output sub meter; wire/slot row V30/V37)*
+*Last updated: 2026-09-12 (6th-order bass bands and RAM cost; continuous bass bank, V3 and RAM costs; spectrum analyser row: FFT ceiling lowered to 1024 points, RAM cost revised; 2026-09-07: LF FFT replaced by continuous bank, protocol V2 and RAM cost; 2026-09-04: subharm row: new parameters and per-output sub meter; wire/slot row V30/V37)*
 
 ### Hardware
 
@@ -2002,7 +2002,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | Crossfeed | Per output pair, post-matrix (PASS 4.5); 2 pairs; `output_pair_mask` (default pair 1) | Per output pair, post-matrix (PASS 4.5); 4 pairs; `output_pair_mask` (default pair 1). Both platforms: shared coeffs, per-pair state, works in every input mode |
 | Psychoacoustic bass | Per output, pre-crossover; RBJ Q28 biquads (with pre-drive low-band clamp) | Per output, pre-crossover; TPT SVF float. Both platforms: missing-fundamental NLD, `output_mask`, zero added latency |
 | Subharmonic synthesizer | Per output, pre-crossover, ahead of psybass; same kernel in Q28 through `fast_mul_q28` (band clamp before the divider); 10-byte sub meter (5 outputs) | Per output, pre-crossover, ahead of psybass; same kernel in float; 18-byte sub meter (9 outputs). Both platforms: TPT SVF band split, hysteresis octave dividers, phase-aligned sum, LF bell, `output_mask`, selectivity, sub ceiling, pair link, runtime solo, headroom reading, zero added latency |
-| Spectrum analyser (RTA) | Q15 `int16_t` kernel; default order 9 (512 points), max 10 (1024); measured per-bin dynamic range 78 dB (`RtaCaps.dynamic_range_db` = 78); 5 tracked channels; ~3.8 KB analyser BSS | Float kernel; default order 10 (1024 points), max 10 (1024); dynamic range 120 dB, limited by the wire level byte rather than arithmetic; 9 tracked channels; ~6.7 KB analyser BSS |
+| Spectrum analyser (RTA) | Q15 `int16_t` kernel; default order 9 (512 points), max 10 (1024); measured per-bin dynamic range 78 dB (`RtaCaps.dynamic_range_db` = 78); 5 tracked channels; Q27 continuous 10–200 Hz bass bank (6th-order bands) with 64-bit power; ~6.9 KB analyser BSS | Float kernel; default order 10 (1024 points), max 10 (1024); dynamic range 120 dB, limited by the wire level byte rather than arithmetic; 9 tracked channels; float continuous 10–200 Hz bass bank (6th-order bands); ~11.2 KB analyser BSS |
 | Stereo upmixer | Not available (compiled out; matrix untouched) | Stereo input only: derives C/Ls/Rs into matrix rows 2..4 (passive/adaptive/off centre; off/passive/adaptive surround). Zero-latency steering; deliberate per-row surround Haas delay |
 | EQ channels | 7 (NUM_CHANNELS) | 11 (NUM_CHANNELS) |
 
@@ -2077,25 +2077,20 @@ masked, and PDM claims its channel once at init.
 ---
 
 ## Memory Layout
-*Last updated: 2026-09-12 (spectrum analyser FFT ceiling lowered to 1024 points: BSS -2,560 B RP2040 / -4,608 B RP2350, flash -3.5 KB / -6.6 KB; 2026-09-07: auxiliary outputs reworked as binding-slot components: +~130 B BSS both platforms, preset directory back to 3035 B at V21; 2026-08-12: Control Surfaces display, +~750 B BSS both platforms, ~12 KB flash)*
+*Last updated: 2026-09-12 (bass bands 6th-order: BSS +1,456 B RP2040 / +2,352 B RP2350; continuous bass bank: BSS +1,580 B RP2040 / +2,000 B RP2350; spectrum analyser FFT ceiling lowered to 1024 points: BSS -2,560 B RP2040 / -4,608 B RP2350, flash -3.5 KB / -6.6 KB; 2026-09-07: auxiliary outputs reworked as binding-slot components: +~130 B BSS both platforms, preset directory back to 3035 B at V21; 2026-08-12: Control Surfaces display, +~750 B BSS both platforms, ~12 KB flash)*
 
-> **Spectrum analyser (2026-09-12).** One capture buffer sized for the largest
-> transform, now 1024 points: **2,048 B on RP2040 (Q15) / 4,096 B on RP2350
-> (float)**, a 529 B bin frame (16 B header + 512 bin levels + seq tail),
-> per-channel band state (36 float EMA powers + 36 avg + 36 peak bytes + timers
-> per tracked channel: 5 channels on RP2040, 9 on RP2350) and about 170 B of
-> engine state and response staging. Measured against HEAD: **BSS +3,888 B
-> RP2040 / +6,848 B RP2350**, RAM image (RAM-pinned tap and packet bookkeeping)
-> +208 B / +296 B, flash text +11.4 KB / +14.1 KB (kernel, engine, handlers, and
-> the 1024-point twiddle and band tables). Lowering the ceiling from 2048 to
-> 1024 on 2026-09-12 gave back 2,560 B / 4,608 B of BSS and 3.5 KB / 6.6 KB of
-> flash, at the cost of the lowest bands: the first resolved band at 48 kHz
-> moves from 25 Hz to 50 Hz. The `.data` budgets in
-> `scripts/check_ram_placement.py` were raised to 64K / 90K: the RP2040 image
-> had 368 B of headroom and the RP2350 image had already outgrown 72K before
-> this feature. A decimated bass stream and a continuous bass filter bank were
-> both built and removed; the analyser is a single transform. See "Spectrum
-> Analyser (RTA / FFT)".
+> **Spectrum analyser (2026-09-12).** Capture remains **2,048 B RP2040 /
+> 4,096 B RP2350**, with a 529 B raw-bin frame. The continuous 10–200 Hz bank
+> adds **1,580 B / 2,000 B BSS** over the single-FFT implementation, including
+> protocol V3 and timing state. Sixth-order bass bands then added another
+> **1,456 B / 2,352 B**. Analyzer BSS is now about **6,924 B / 11,200 B**.
+> Bass state is 512 B per fixed-point channel (5 channels), 452 B per float
+> channel (9 channels), plus a shared 700 B RAM coefficient block. Removing
+> duplicate bass EMA storage saves 56 B per channel. Band frames are 82 B,
+> with 37 slots. RAM-pinned streaming code is additional to BSS; the RAM
+> placement checker accounts for it in `.data`. The 1024-point ceiling still
+> saves 2,560 B / 4,608 B versus 2048 points. No audio buffers or delay lines
+> change. See "Spectrum Analyser (RTA / FFT)".
 
 > **Input capture arena (2026-08-06).** The `pico_spdif_rx` FIFO (12 KB), the I2S
 > RX rings (4 KB RP2040 / 32 KB RP2350) and the ADAT RX ring (8 KB, RP2350 only)
@@ -3397,7 +3392,7 @@ lands on a hot path and the audio path is untouched.
 ---
 
 ## Vendor Command Reference
-*Last updated: 2026-09-07 (Control Surfaces auxiliary outputs are now 0x04-0x07 slot-indexed with an 8.8 level; 0x02 and 0x03 removed; spectrum analyser V2 bank/fast-only bins, 0x08-0x0F; 2026-09-04: subharmonic synthesizer widened to 0x10-0x1F, 0x2C-0x2F and 0xA9-0xAE; 2026-09-02: subharmonic synthesizer 0x10-0x1A; REQ_GET_BUILD_INFO 0x80 added 2026-09-01: 64-byte git/date build stamp)*
+*Last updated: 2026-09-12 (RTA V3 bass capability and 82-byte band frames; 2026-09-07: Control Surfaces auxiliary outputs are now 0x04-0x07 slot-indexed with an 8.8 level; 0x02 and 0x03 removed; spectrum analyser V2 bank/fast-only bins, 0x08-0x0F; 2026-09-04: subharmonic synthesizer widened to 0x10-0x1F, 0x2C-0x2F and 0xA9-0xAE; 2026-09-02: subharmonic synthesizer 0x10-0x1A; REQ_GET_BUILD_INFO 0x80 added 2026-09-01: 64-byte git/date build stamp)*
 
 **Band-index map (PEQ and crossover share one address space):**
 
@@ -3417,10 +3412,10 @@ lands on a hot path and the audio path is untouched.
 | REQ_GET_CS_AUX_STATE | 0x05 | IN | Get an auxiliary output's state (wValue = binding slot: 1 byte; wValue = 0xFFFF: 48 bytes, state[16] then sixteen little-endian 8.8 percent levels, zero on slots that are not up aux outputs) |
 | REQ_SET_CS_AUX_LEVEL | 0x06 | OUT | Set an auxiliary output's level (wValue = binding slot, 2 bytes little-endian 8.8 percent, clamped to 100 % = 25600). Immediate, runtime only; pushes `NOTIFY_EVT_CS_AUX` on a change. Rejected with `CS_STATUS_INVALID_AUX` unless the slot is an up `CS_TYPE_AUX_PWM` |
 | REQ_GET_CS_AUX_LEVEL | 0x07 | IN | Get an auxiliary output's level (wValue = binding slot; 2 bytes little-endian 8.8 percent, 0 on a `CS_TYPE_AUX_OUT` slot) |
-| REQ_RTA_SET_CONFIG | 0x08 | OUT | Set the V2 spectrum analyser config (12-byte `RtaConfig`). STALLs on wrong version or length, unknown tap, an `fft_order` outside the caps range (8..10), an unsupported `lf_mode`, or an empty `channel_mask` after masking to the tap's width |
+| REQ_RTA_SET_CONFIG | 0x08 | OUT | Set the V3 spectrum analyser config (12-byte `RtaConfig`). STALLs on wrong version or length, unknown tap, an `fft_order` outside the caps range (8..10), or an empty `channel_mask` after masking to the tap's width |
 | REQ_RTA_GET_CONFIG | 0x09 | IN | Get the applied 12-byte `RtaConfig` (clamped `avg_ms` and `peak_decay_db_s`, masked `channel_mask`) |
 | REQ_RTA_GET_CAPS | 0x0A | IN | wValue 0: the 16-byte `RtaCaps`. wValue 1..: a chunk of the band-centre table, 32 `uint16` Hz values per chunk; a chunk past the end STALLs |
-| REQ_RTA_GET_BANDS | 0x0B | IN | wValue = channel; returns that channel's 80-byte `RtaBandFrame` at the applied tap. Counts as a read (auto-off keepalive + auto-start) |
+| REQ_RTA_GET_BANDS | 0x0B | IN | wValue = channel; returns that channel's 82-byte `RtaBandFrame` at the applied tap. Counts as a read (auto-off keepalive + auto-start) |
 | REQ_RTA_GET_BINS | 0x0C | IN | wValue = byte offset into the bin frame, wLength = chunk size; no lock, validate the header `seq` against the frame's final byte and re-read on mismatch. Counts as a read |
 | REQ_RTA_GET_STATUS | 0x0D | IN | Get the 24-byte `RtaStatus`. Deliberately **not** a read: polling status neither keeps the analyser alive nor starts it |
 | REQ_RTA_CONTROL | 0x0E | IN | GET-style, like `REQ_SIGGEN_CONTROL`: the action is in wValue (`RTA_CTL_STOP` / `START` / `RESET_AVG`) and the reply is one status byte; an unknown action STALLs |
@@ -4587,7 +4582,7 @@ datum is `siggen_raw_mask`, written by Core 0 between blocks.
 ---
 
 ## Spectrum Analyser (RTA / FFT)
-*Last updated: 2026-09-12 (FFT ceiling lowered to 1024 points; 2026-09-07: single transform, bass stream and bass bank removed)*
+*Last updated: 2026-09-12 (Blackman-Harris FFT window; sixth-order bass bands; continuous bass bank and V3 protocol; FFT ceiling lowered to 1024 points; 2026-09-07: single transform, bass stream and bass bank removed)*
 
 One FFT engine (`rta.c`, kernel in `rta_fft.c`, generated tables in
 `rta_tables.h` from `scripts/gen_rta_tables.py`) that can be pointed at any set
@@ -4604,8 +4599,7 @@ itself off after 5 s without a data read. Full protocol and design:
 per-channel peak-meter loops: the input meter loop in PASS 2 (plus the
 upmix-derived-row meter loop), and every output meter loop on both cores,
 which sit after gain and delay and before `output_block_to_s24_inplace()`.
-The tap copies samples into the capture buffer and writes back the count it
-copied; it changes no sample and no sample count, so inter-slot alignment is
+The tap copies FFT samples and continuously updates the selected channel’s bass bank, then writes back its copy count and bass timing; it changes no sample and no sample count, so inter-slot alignment is
 untouched by construction.
 
 **Per-packet view.** Core 0 writes `rta_view` (`RtaPacketView`: tap, row, write
@@ -4620,7 +4614,7 @@ pre-empts `process_input_block()`.
 
 **Frame machine.** `FILL` (taps copy) to `FFT` (one bounded kernel step per
 `rta_service()` call: prescale, radix-4 stages, permutation, real split) to
-`FINISH` (frequency-domain Hann, bin powers, band sums, level bytes, publish)
+`FINISH` (frequency-domain Blackman-Harris, bin powers, band sums, level bytes, publish)
 and then the next live channel. `rta_service()` sits next to `siggen_service()`
 in the main loop. Per-channel refresh interval = (fill + transform) x live
 channel count; at 1024 points and 48 kHz that is 21 ms per channel, 171 ms
@@ -4628,15 +4622,53 @@ with eight channels live. If the channel being filled stops being live (USB
 alt change, disabled output, upmixer parked) the main loop moves on, so a frame
 never stalls.
 
-**Products.** Third-octave bands (31 at 44.1/48 kHz, 34 at 96 kHz; DC bin in no
+**Products.** Hybrid third-octave bands (34 at 44.1/48 kHz, 37 at 96 kHz; 10–200 Hz from the continuous bank, higher bands from the FFT; DC bin in no
 band; a band with no bin at the current size is empty, reads 0, and
-`RtaStatus.first_band` says where resolution starts) with power-domain EMA
+`RtaStatus.first_band` is 0 because the bass bank reaches 10 Hz; FFT gaps above 200 Hz at small sizes remain empty) with power-domain EMA
 averaging and peak hold whose decay time is carried between publishes; and the
 raw bins of the latest frame. Levels are one byte in 0.5 dB steps with 243 =
-0 dBFS. First resolved band at 48 kHz: 200 Hz at 256 points, 100 Hz at 512,
+0 dBFS. First FFT bin-containing band at 48 kHz: 200 Hz at 256 points, 100 Hz at 512,
 50 Hz at 1024, which is the ceiling. 2048 points would reach 25 Hz and is not
 offered: the capture buffer is always sized for the largest order, so it would
 cost another 4,608 B of BSS on RP2350.
+
+**Continuous bass bank.** `rta_bass.c` consumes every sample of every selected
+live channel, including other channels' FFT turns. CIC3 /8 (44.1/48 kHz) or
+/16 (96 kHz), followed by an eighth-order elliptic low-pass and /8, produces
+689.0625/750 Hz streams. Fourteen sixth-order Butterworth bandpass bands
+(three sections each, generated with prefix gain normalisation) cover exact
+base-10 centres 10–199.526 Hz. Unsigned modular CIC arithmetic avoids floating-point
+integrator drift; the decimated kernel uses Q27 states/Q28 coefficients with
+64-bit intermediates and Q48 power on RP2040, float on RP2350. Coefficients
+are generated by `scripts/gen_rta_bass.py`, then copied to RAM at configuration.
+Each owning core updates its channel only; Core 0 snapshots the bass mask and
+clears entering/leaving channels before dispatch, then reads powers after the
+join. Start/restart/RESET_AVG discard bass history. No audio alignment or reset
+rules change.
+
+The bass power EMA replaces duplicate per-frame EMA storage and uses the longer
+of one frequency period or `avg_ms`. Results and peak hold publish on the
+existing FFT rotation. Host tests with `avg_ms=0` measure 90% power response in
+590/300/50 ms at 10/19.953/199.526 Hz, independent of selected channel count;
+publication adds up to one ordinary FFT rotation. All 14 centres at all three
+rates pass float64-oracle, -60/-70 dBFS, hot-input, DC, alias and selectivity
+checks. Tested aliases are suppressed by more than 85 dB. A tone reads at least
+40 dB down one octave away and 60 dB down two octaves away. The earlier
+single-biquad bands leaked only about 16 dB at one octave, so a bass tone lit
+every band. Calculated pink-noise power is 0.1–0.2 dB above disjoint
+third-octave integration. The sections triple band-filter work at 689/750 Hz.
+The 6 kHz elliptic stage is unchanged, so per-channel bass multiplies rise by
+roughly a third. Raw FFT bins remain unchanged and receive no synthetic bass bins.
+
+**V3 protocol.** `RTA_MAX_BANDS=37`; band frames grow to 82 B, centre indices
+shift by three, and the whole-Hz caps table begins 10/13/16/20. Config/caps/
+status/bin-header sizes remain 12/16/24/16 B. Caps exposes `bass_bands=14` and
+`bass_dynamic_range_db=70`; existing dynamic range refers to FFT only. Status
+adds `bass_busy_us_per_s` in its final formerly-reserved uint16: summed elapsed
+bass tap time on both cores normalised to one second, saturated at 65535 us.
+Clients must negotiate V3 and derive frame strides/centres from caps. The
+in-repo test client is updated; Console is a separate repository and needs a
+matching release. No vendor command IDs were added.
 
 **Bin frame protocol.** `REQ_RTA_GET_BINS` is chunked by byte offset with no
 lock. The frame is `16 + n_bins + 1` bytes with the sequence number in the
@@ -4651,24 +4683,35 @@ is a keepalive and auto-starts the analyser; `REQ_RTA_GET_STATUS` is not.
 `RTA_FLAG_MANUAL` hands the run state to `REQ_RTA_CONTROL` entirely (no
 auto-start, no auto-off).
 
-**RAM placement.** `rta_tap`, `rta_packet_begin` and `rta_packet_end` are
+**RAM placement.** `rta_tap`, `rta_packet_begin`, `rta_packet_end`, `rta_bass_push` and the live-mask helper are
 `DSP_TIME_CRITICAL` (they run inside the meter loops on both cores, including
-during flash writes) and are listed in `scripts/check_ram_placement.py`. The
-transform, the band sums, the twiddle and band tables, and all control paths
-stay in flash.
+during flash writes). The checker roots and their transitive call closure
+verify their RAM placement. Generated source tables remain in flash; the
+active bass coefficient copy resides in RAM. FFT and control paths stay in flash.
 
 **Kernel accuracy (host harness, `tools/rta_test/run.sh`, orders 8 to 10).**
-Full-scale sine within 0.003 dB in its band; bins within 0.26 dB (float) and
-0.49 dB (Q15) of a numpy Hann FFT; pink noise flat within 0.6 dB; Q15 dynamic
-range 78.5 dB, float 121.5 dB (the wire floor). A tone on a band edge splits
-its Hann main lobe across two bands, so each reads up to 3.01 dB low while the
-pair sums correctly. A -60 dBFS tone reads up to 1.11 dB high in Q15 at 1024
-points, because the band sums the per-bin Q15 floor across all its bins.
+Full-scale sine within 0.062 dB in its band; bins within 0.255 dB (float) and
+0.232 dB (Q15) of a numpy Blackman-Harris FFT; pink noise flat within 0.72 dB; Q15 dynamic
+range 78.5 dB, float 121.5 dB (the wire floor). The shared level converter now uses multiplication rather than left-shifting a negative exponent, removing undefined C behavior without changing levels. A tone on a band edge splits
+its window main lobe across two bands, so each reads up to 3.01 dB low while the
+pair sums correctly. A -60 dBFS tone reads up to 1.24 dB high in Q15 at 1024
+points (tolerance 1.25), because the band sums the per-bin Q15 floor across all its bins.
+
+**FFT window (updated 2026-09-12).** The window is 4-term Blackman-Harris,
+applied after the transform as a 7-tap kernel with conjugate-symmetric bins
+past DC and Nyquist, scaled so bin levels keep the Hann normalisation. Hann's
+slow sidelobe decay leaked loud 20-100 Hz tones into the first FFT bands at
+-40 to -55 dB, a fixed hump next to the much cleaner bass bank. Engine
+simulation at 1024 points now puts that leakage at -98 dB or lower (float).
+The wider main lobe makes the lowest FFT band worse at 512 and 256 points and
+reads a centred tone 3.02 dB low in one-bin bands. Q15 window products stay
+under 1.50e9 and bin power is squared unsigned. FINISH does about twice the
+per-bin work; on-device timing is unmeasured.
 
 **CPU.** The transform is main-loop work and does not appear in `cpu0_load`;
 `RtaStatus.busy_us_per_s` and `last_frame_us` report it instead. Host
 operation counts put a 1024-point Q15 frame at about 110k cycles (1.7% of an
-RP2040 core at the frame rate); the bench figure is pending.
+RP2040 core at the frame rate); the bench figure is pending. Bass filtering is synchronous audio work and scales with live channels; its new timer is separate from FFT timing, and existing audio CPU meters also include it. On-device CPU, deadline and physical alignment validation remain pending.
 
 **Vendor surface.** Commands 0x08 to 0x0F (see the Vendor Command Reference).
 `REQ_RTA_GET_BANDS_ALL` is USB-only and built in `bulk_param_buf` under the bulk

@@ -24,12 +24,15 @@ typedef float    rta_bandacc_t; // band power accumulator
 #define RTA_Q4(x)     ((x) * 0.25f)
 #define RTA_Q2(x)     ((x) * 0.5f)
 #define RTA_ISQRT2(x) ((x) * 0.707106781f)
-#define RTA_BAND_SCALE  10.6666667f   // 1 / 0.09375, full-scale sine -> 1.0
+#define RTA_BAND_SCALE  7.9826261f    // 1 / 0.125272059, full-scale sine -> 1.0
 
 static inline rta_sample_t rta_st(rta_acc_t v) { return v; }
 
-static inline rta_acc_t rta_hann(rta_acc_t cur, rta_acc_t prev, rta_acc_t next) {
-    return 0.5f * cur - 0.25f * (prev + next);
+// 4-term Blackman-Harris on X[k-3..k+3], scaled to a 0.5 centre tap so a
+// bin-centred sine keeps Hann's bin level.  Hann leaked loud bass into 250-500 Hz.
+static inline rta_acc_t rta_window(const rta_acc_t *x) {
+    return 0.5f * x[3] - 0.340271777f * (x[2] + x[4])
+         + 0.098452962f * (x[1] + x[5]) - 0.008139373f * (x[0] + x[6]);
 }
 
 static inline rta_binpow_t rta_bin_power(rta_acc_t wr, rta_acc_t wi) {
@@ -47,7 +50,7 @@ typedef uint64_t rta_bandacc_t;
 #define RTA_Q4(x)     (((x) + 2) >> 2)
 #define RTA_Q2(x)     (((x) + 1) >> 1)
 #define RTA_ISQRT2(x) ((((x) * 23170) + 16384) >> 15)
-#define RTA_BAND_SCALE  9.93410747e-9f  // 1 / (32768^2 * 0.09375)
+#define RTA_BAND_SCALE  7.43439986e-9f  // 1 / (32768^2 * 0.125272059)
 
 static inline rta_sample_t rta_st(rta_acc_t v) {
     if (v > 32767) v = 32767;
@@ -55,12 +58,17 @@ static inline rta_sample_t rta_st(rta_acc_t v) {
     return (rta_sample_t)v;
 }
 
-static inline rta_acc_t rta_hann(rta_acc_t cur, rta_acc_t prev, rta_acc_t next) {
-    return RTA_Q4(2 * cur - prev - next);
+// Same window in Q15.  Worst-case accumulator is 1.50e9, inside int32.
+static inline rta_acc_t rta_window(const rta_acc_t *x) {
+    return (16384 * x[3] - 11150 * (x[2] + x[4]) + 3226 * (x[1] + x[5])
+            - 267 * (x[0] + x[6]) + 16384) >> 15;
 }
 
+// Window output reaches 45685, so squares are taken unsigned (sum <= 4.18e9).
 static inline rta_binpow_t rta_bin_power(rta_acc_t wr, rta_acc_t wi) {
-    return (rta_binpow_t)(wr * wr) + (rta_binpow_t)(wi * wi);
+    const uint32_t ur = (uint32_t)(wr < 0 ? -wr : wr);
+    const uint32_t ui = (uint32_t)(wi < 0 ? -wi : wi);
+    return ur * ur + ui * ui;
 }
 
 #endif
@@ -120,7 +128,7 @@ static inline int32_t rta_log2_frac_q8(uint32_t f12) {
 static int32_t rta_log2_q8_u32(uint32_t v) {
     const int32_t e = 31 - (int32_t)__builtin_clz(v);
     const uint32_t m = (e >= 12) ? (v >> (e - 12)) : (v << (12 - e));
-    return (e << 8) + rta_log2_frac_q8(m & 0xFFFu);
+    return (e * 256) + rta_log2_frac_q8(m & 0xFFFu);
 }
 #endif
 
@@ -139,7 +147,7 @@ uint8_t rta_level_from_power(float power) {
     b.f = power;
     const int32_t e = (int32_t)((b.u >> 23) & 0xFFu) - 127;
     if (e < -64) return 0;   // below the wire floor, and keeps denormals out
-    return rta_level_from_log2_q8((e << 8) + rta_log2_frac_q8((b.u >> 11) & 0xFFFu));
+    return rta_level_from_log2_q8((e * 256) + rta_log2_frac_q8((b.u >> 11) & 0xFFFu));
 }
 
 // One bin's level from its power in the format's native units.
@@ -344,6 +352,18 @@ bool rta_fft_step(rta_sample_t *buf, uint8_t order, uint8_t *stage) {
 // Window, power, bands
 // ---------------------------------------------------------------------------
 
+// X[i] for i in [-3, n_bins + 3].  Slot 0 holds the real X[0] and the real
+// Nyquist bin; the spectrum is conjugate-symmetric about both.
+static inline void rta_bin_at(const rta_sample_t *buf, int32_t i, int32_t n_bins,
+                              rta_acc_t *re, rta_acc_t *im) {
+    rta_acc_t sign = 1;
+    if (i < 0) { i = -i; sign = -1; }
+    else if (i > n_bins) { i = 2 * n_bins - i; sign = -1; }
+    if (i == 0 || i == n_bins) { *re = buf[i ? 1 : 0]; *im = 0; return; }
+    *re = buf[2 * i];
+    *im = sign * (rta_acc_t)buf[2 * i + 1];
+}
+
 void rta_fft_finish(const rta_sample_t *buf, uint8_t order,
                     const RtaBandTable *table, float *band_power, uint8_t *bins) {
     if (order < RTA_ORDER_MIN || order > RTA_ORDER_MAX) return;
@@ -361,22 +381,14 @@ void rta_fft_finish(const rta_sample_t *buf, uint8_t order,
     }
     if (!bins && !n_bands) return;
 
-    // X[0] is real in slot 0 and the real Nyquist bin sits in its imaginary
-    // half, so both ends of the sweep need their neighbour synthesised.
-    rta_acc_t pr = 0, pi = 0;
-    rta_acc_t cr = buf[0], ci = 0;
     uint8_t b0 = 0;
 
     for (uint16_t k = 0; k < n_bins; k++) {
-        rta_acc_t nr, ni;
-        if (k + 1u == n_bins) {
-            nr = buf[1]; ni = 0;
-        } else {
-            nr = buf[2 * (k + 1)]; ni = buf[2 * (k + 1) + 1];
+        rta_acc_t re[7], im[7];
+        for (int32_t j = 0; j < 7; j++) {
+            rta_bin_at(buf, (int32_t)k + j - 3, n_bins, &re[j], &im[j]);
         }
-        if (k == 0) { pr = nr; pi = -ni; }   // X[-1] = conj(X[1])
-
-        const rta_binpow_t p = rta_bin_power(rta_hann(cr, pr, nr), rta_hann(ci, pi, ni));
+        const rta_binpow_t p = rta_bin_power(rta_window(re), rta_window(im));
         if (bins) bins[k] = rta_bin_level(p);
 
         if (n_bands) {
@@ -385,8 +397,6 @@ void rta_fft_finish(const rta_sample_t *buf, uint8_t order,
                 if (k <= table->hi[b]) acc[b] += p;
             }
         }
-        pr = cr; pi = ci;
-        cr = nr; ci = ni;
     }
 
     for (uint8_t b = 0; b < n_bands; b++) {

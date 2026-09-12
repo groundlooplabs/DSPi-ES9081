@@ -12,9 +12,9 @@ section 4.2.
 ./run.sh
 ```
 
-Needs `clang` and `python3` with numpy. `test_rta.py` builds the shared
+Needs `clang` and `python3` with numpy and scipy. `test_rta.py` builds the shared
 libraries into `build/`; `test_engine.py` builds two throwaway executables.
-Both print PASS or FAIL and exit non-zero on failure.
+All print PASS or FAIL and exit non-zero on failure.
 
 ## What test_rta.py checks
 
@@ -22,7 +22,7 @@ One row per (format, order, rate):
 
 | column | meaning | tolerance |
 |---|---|---|
-| bins | worst bin level error against a numpy Hann FFT | 0.35 dB float, 0.75 dB Q15 |
+| bins | worst bin level error against a numpy Blackman-Harris FFT | 0.35 dB float, 0.75 dB Q15 |
 | fs-bnd | full-scale sine level error in its band | 0.5 dB |
 | -60bnd | -60 dBFS sine level error in its band | 0.2 dB float; 1.25 dB Q15 |
 | edgepr | sine on a band edge, error of the two-band sum | 0.5 dB |
@@ -44,13 +44,16 @@ stated tolerance.
   for. `RtaCaps.dynamic_range_db` reports 78. The -100 dBFS floor test passes
   in Q15 only because a 0.33 LSB tone quantises to silence; `dyn-rng` is the
   honest number.
-- **A tone on a band edge reads up to 3.01 dB low in each band.** The Hann main
+- **The FFT window is 4-term Blackman-Harris.** Hann's slow sidelobe decay let
+  loud bass leak into the first FFT bands above the bass bank as a fixed hump.
+  The wider main lobe reads a centred tone 3.02 dB low in a one-bin band.
+- **A tone on a band edge reads up to 3.01 dB low in each band.** The window main
   lobe splits across the two bands, so the pair sums correctly but no single
   band can. A client that wants a tone's level should sum the pair.
-- **A -60 dBFS sine reads up to 1.11 dB high in Q15 at order 10**, the
-  largest size. The band sums the per-bin floor across all its bins, and the
-  floor is closer at higher orders because every stage halves. Order 9, the
-  RP2040 default, stays within 0.94 dB.
+- **A -60 dBFS sine reads up to 1.24 dB high in Q15 at order 10**, the
+  largest size, 0.01 dB inside tolerance. The band sums the per-bin floor across
+  all its bins, and the floor is closer at higher orders because every stage
+  halves. Order 9, the RP2040 default, stays within 1.08 dB.
 - **Two real samples packed into one complex slot give sqrt(2) full scale**,
   so the Q15 path prescales by 1/sqrt(2) and the split pass restores it. That
   is why the Q15 range is 3 dB short of a plain 16-bit floor.
@@ -62,3 +65,24 @@ version and order rejection, caps, all-channel rotation cadence on a tone, the
 bin frame layout and seq head/tail, recovery when a channel goes dead
 mid-fill, restart, a switch to the 1024-point ceiling, and auto-off after 5 s without a
 read.
+
+
+## Continuous bass and V3 integration (2026-09-12)
+
+`test_bass.py` compiles the actual streaming kernel in both formats and checks
+all 14 centres at 44.1/48/96 kHz against a separate float64 scipy signal-chain
+oracle. It also checks -60/-70 dBFS, full-scale and hot inputs, DC rejection,
+alias rejection, band selectivity (at least 40 dB one octave from a tone and
+60 dB two octaves away), irregular packet sizes, channel isolation and step response.
+The response thresholds exclude user averaging and FFT publication scheduling.
+
+`test_engine.py` additionally runs undefined-behavior sanitization and checks
+V2 rejection/V3 layout, identical continuous histories for every selected
+channel during FFT rotation, input/output tap selection, sample immutability,
+liveness resets, averaging changes, RESET_AVG, rate restart and stop/start.
+No host test establishes an on-device CPU percentage or physical output timing.
+
+Generate coefficients with `python3 scripts/gen_rta_bass.py`; generate the
+37-band FFT tables with `python3 scripts/gen_rta_tables.py --out
+firmware/DSPi/rta_tables.h`. Each bass band is a sixth-order Butterworth
+bandpass calibrated for tones at its exact centre.

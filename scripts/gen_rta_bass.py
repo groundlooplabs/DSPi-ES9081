@@ -24,6 +24,10 @@ def design(rate):
         peak = max(abs(h))
         sos[j,:3] /= peak
         sos[j+1,:3] *= peak
+    # Elliptic zeros sit on the unit circle, so b2 == b0 up to rounding; the
+    # kernel stores b0 once and reuses b0*x.
+    assert np.allclose(sos[:,0], sos[:,2], rtol=1e-12, atol=0)
+    sos[:,2] = sos[:,0]
     bands = []
     for b in range(14):
         fc = 1000 * 10 ** ((b - 20) / 10)
@@ -63,7 +67,7 @@ for rate in (44100,48000,96000):
     for FLOAT in (True, False):
         lines.append('#if RTA_SAMPLE_FLOAT' if FLOAT else '#else')
         for row in sos:
-            lines.append('            { '+', '.join(value(x) for x in [*row[:3],*row[4:]])+' },')
+            lines.append('            { '+', '.join(value(x) for x in (row[0], row[1], row[4], row[5]))+' },')
     lines += ['#endif','        },','        .band = {']
     for FLOAT in (True,False):
         lines.append('#if RTA_SAMPLE_FLOAT' if FLOAT else '#else')

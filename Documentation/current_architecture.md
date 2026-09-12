@@ -707,9 +707,9 @@ RP2040 is unaffected: its band-major assembly kernels (`dsp_process_rp2040.S`) a
 
 **FPU configuration (RP2350):** Both cores set FPSCR flush-to-zero (FZ) and default-NaN (DN) bits at startup. This prevents denormalized floats from causing performance penalties as SVF integrator and biquad states decay toward zero after silence.
 
-**FP contraction (added 2026-08-05, RP2350 only):** `dsp_pipeline.c` is compiled with `-ffp-contract=off`, so the EQ kernels use separate VMUL/VADD instead of fused VFMA. Hardware measurement on the CPU meter established that the M33 FMA pipeline is throughput-bound with an effective VFMA occupancy of roughly 2 to 2.5 cycles versus 1 for VMUL/VADD: de-contraction emits ~58 % more FP instructions (and eliminates the VMOV accumulator copies VFMA's destructive form forces) yet measures 14 to 24 % less EQ cost on every kernel path, SVF and biquad alike, with no register spills. Loads/stores already overlap FPU issue, so FP-op *occupancy* is the only currency that matters in these loops. That is why the fused kernel only became worthwhile once its arms were specialized to match the single kernels' op counts (above): while it used the generic 9-op form it was giving back most of what the saved memory traffic won. Precision cost of double rounding is negligible and was verified on hardware: loopback THD, noise floor, and flat-path residual byte-identical to the contracted build, filter responses within 0.01 dB, and host analysis puts the noise penalty at ~1.5 dB on a −137 dB re-signal error floor. The flag is per-file: other DSP translation units (loudness, psybass, leveller, crossfeed, upmix) still contract and are candidates for the same measure-then-decide treatment. `subharm.c` (added 2026-09-02) also compiles with `-ffp-contract=off`: a static count of its kernel loop shows FMAs 70 to 0, VMOV accumulator copies 25 to 4, FP instructions 109 to 175, and an occupancy-weighted estimate about 9 % fewer cycles per sample; the hardware CPU-meter confirmation is still pending.
+**FP contraction (added 2026-08-05, RP2350 only):** `dsp_pipeline.c` is compiled with `-ffp-contract=off`, so the EQ kernels use separate VMUL/VADD instead of fused VFMA. Hardware measurement on the CPU meter established that the M33 FMA pipeline is throughput-bound with an effective VFMA occupancy of roughly 2 to 2.5 cycles versus 1 for VMUL/VADD: de-contraction emits ~58 % more FP instructions (and eliminates the VMOV accumulator copies VFMA's destructive form forces) yet measures 14 to 24 % less EQ cost on every kernel path, SVF and biquad alike, with no register spills. Loads/stores already overlap FPU issue, so FP-op *occupancy* is the only currency that matters in these loops. That is why the fused kernel only became worthwhile once its arms were specialized to match the single kernels' op counts (above): while it used the generic 9-op form it was giving back most of what the saved memory traffic won. Precision cost of double rounding is negligible and was verified on hardware: loopback THD, noise floor, and flat-path residual byte-identical to the contracted build, filter responses within 0.01 dB, and host analysis puts the noise penalty at ~1.5 dB on a −137 dB re-signal error floor. The flag is per-file: other DSP translation units (loudness, psybass, leveller, crossfeed, upmix) still contract and are candidates for the same measure-then-decide treatment. `subharm.c` (added 2026-09-02) also compiles with `-ffp-contract=off`: a static count of its kernel loop shows FMAs 70 to 0, VMOV accumulator copies 25 to 4, FP instructions 109 to 175, and an occupancy-weighted estimate about 9 % fewer cycles per sample; the hardware CPU-meter confirmation is still pending. `rta_bass.c` (added 2026-09-12) compiles with `-O3 -ffp-contract=off` on RP2350 only. Its float bass kernel goes from 8 fused multiply-adds to none, at a cost of 256 B of RAM code, and the speed gain is unmeasured (`RtaStatus.bass_busy_us_per_s`). RP2040 keeps `-O2`: its fixed-point kernel has no FP ops, and `-O3` only unrolled the loops for 1.6 KB more RAM code.
 
-*Last updated: 2026-08-06*
+*Last updated: 2026-09-12 (rta_bass.c FP contraction, RP2350 only; previously 2026-08-06)*
 
 **Memory impact:** Biquad struct grows from ~48 to ~68 bytes on RP2350. With 110 EQ biquads at the larger size: ~3 KB additional BSS. (Loudness no longer uses the full `Biquad` struct; since 2026-07-09 its per-output shelf state is a separate minimal array, `loudness_output_state`, 144 B on RP2350 / 80 B on RP2040.)
 
@@ -2077,7 +2077,7 @@ masked, and PDM claims its channel once at init.
 ---
 
 ## Memory Layout
-*Last updated: 2026-09-12 (bass bands 6th-order: BSS +1,456 B RP2040 / +2,352 B RP2350; continuous bass bank: BSS +1,580 B RP2040 / +2,000 B RP2350; spectrum analyser FFT ceiling lowered to 1024 points: BSS -2,560 B RP2040 / -4,608 B RP2350, flash -3.5 KB / -6.6 KB; 2026-09-07: auxiliary outputs reworked as binding-slot components: +~130 B BSS both platforms, preset directory back to 3035 B at V21; 2026-08-12: Control Surfaces display, +~750 B BSS both platforms, ~12 KB flash)*
+*Last updated: 2026-09-12 (shared elliptic b0: BSS -16 B both platforms, RP2350 RAM code +256 B from -O3; bass bands 6th-order: BSS +1,456 B RP2040 / +2,352 B RP2350; continuous bass bank: BSS +1,580 B RP2040 / +2,000 B RP2350; spectrum analyser FFT ceiling lowered to 1024 points: BSS -2,560 B RP2040 / -4,608 B RP2350, flash -3.5 KB / -6.6 KB; 2026-09-07: auxiliary outputs reworked as binding-slot components: +~130 B BSS both platforms, preset directory back to 3035 B at V21; 2026-08-12: Control Surfaces display, +~750 B BSS both platforms, ~12 KB flash)*
 
 > **Spectrum analyser (2026-09-12).** Capture remains **2,048 B RP2040 /
 > 4,096 B RP2350**, with a 529 B raw-bin frame. The continuous 10–200 Hz bank
@@ -2085,7 +2085,9 @@ masked, and PDM claims its channel once at init.
 > protocol V3 and timing state. Sixth-order bass bands then added another
 > **1,456 B / 2,352 B**. Analyzer BSS is now about **6,924 B / 11,200 B**.
 > Bass state is 512 B per fixed-point channel (5 channels), 452 B per float
-> channel (9 channels), plus a shared 700 B RAM coefficient block. Removing
+> channel (9 channels), plus a shared 684 B RAM coefficient block (the
+> elliptic sections do not store b2). RP2350 compiles the bass kernel at
+> `-O3 -ffp-contract=off`, which adds 256 B of RAM code. Removing
 > duplicate bass EMA storage saves 56 B per channel. Band frames are 82 B,
 > with 37 slots. RAM-pinned streaming code is additional to BSS; the RAM
 > placement checker accounts for it in `.data`. The 1024-point ceiling still
@@ -4582,7 +4584,7 @@ datum is `siggen_raw_mask`, written by Core 0 between blocks.
 ---
 
 ## Spectrum Analyser (RTA / FFT)
-*Last updated: 2026-09-12 (Blackman-Harris FFT window; sixth-order bass bands; continuous bass bank and V3 protocol; FFT ceiling lowered to 1024 points; 2026-09-07: single transform, bass stream and bass bank removed)*
+*Last updated: 2026-09-12 (shared elliptic b0 and RP2350 -O3 bass kernel; Blackman-Harris FFT window; sixth-order bass bands; continuous bass bank and V3 protocol; FFT ceiling lowered to 1024 points; 2026-09-07: single transform, bass stream and bass bank removed)*
 
 One FFT engine (`rta.c`, kernel in `rta_fft.c`, generated tables in
 `rta_tables.h` from `scripts/gen_rta_tables.py`) that can be pointed at any set
@@ -4635,7 +4637,10 @@ cost another 4,608 B of BSS on RP2350.
 **Continuous bass bank.** `rta_bass.c` consumes every sample of every selected
 live channel, including other channels' FFT turns. CIC3 /8 (44.1/48 kHz) or
 /16 (96 kHz), followed by an eighth-order elliptic low-pass and /8, produces
-689.0625/750 Hz streams. Fourteen sixth-order Butterworth bandpass bands
+689.0625/750 Hz streams. The elliptic sections' zeros lie on the unit circle,
+so b2 equals b0: the tables store b0 once and the kernel reuses the b0*x
+product, one multiply fewer per section at 6 kHz with bit-identical output.
+Fourteen sixth-order Butterworth bandpass bands
 (three sections each, generated with prefix gain normalisation) cover exact
 base-10 centres 10–199.526 Hz. Unsigned modular CIC arithmetic avoids floating-point
 integrator drift; the decimated kernel uses Q27 states/Q28 coefficients with

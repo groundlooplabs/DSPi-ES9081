@@ -128,6 +128,9 @@ else()
     # RP2350: SPDIF RX on PIO2 (dedicated block, proven working).
     # I2S RX reuses the same SM when SPDIF RX is inactive.
     target_compile_definitions(DSPi PRIVATE PICO_SPDIF_RX_PIO=2)
+    # Float bass kernel: same FP-contraction rule as dsp_pipeline.c (8 VFMAs -> 0,
+    # unmeasured). RP2040's fixed-point build keeps -O2; -O3 only added 1.6 KB of RAM code.
+    set_source_files_properties(rta_bass.c PROPERTIES COMPILE_FLAGS "-O3 -ffp-contract=off")
 endif()
 # PICO_FLASH_SPI_CLKDIV=6 is set at the top-level CMakeLists so it reaches
 # the boot2 build (target-level defines don't propagate to it).

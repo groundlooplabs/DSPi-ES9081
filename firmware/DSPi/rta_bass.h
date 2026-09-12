@@ -11,7 +11,7 @@ typedef int32_t rta_bass_value_t; /* state Q27, coefficients Q28 */
 #endif
 
 typedef struct {
-    rta_bass_value_t b0, b1, b2, a1, a2;
+    rta_bass_value_t b0, b1, a1, a2; /* numerator b0 + b1*z^-1 + b0*z^-2 */
 } RtaBassSos;
 typedef struct {
     rta_bass_value_t b0, a1, a2; /* numerator b0*(1 - z^-2) */

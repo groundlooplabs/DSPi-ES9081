@@ -67,14 +67,16 @@ void RTA_RAM_FUNC rta_bass_push(const RtaBassCoeffs *c, RtaBassChannel *s,
         for (int j = 0; j < RTA_BASS_SOS; j++) {
             const RtaBassSos *q = &c->lowpass[j];
 #if RTA_SAMPLE_FLOAT
-            float y = q->b0*x + s->lp[j][0];
+            float bx = q->b0*x;
+            float y = bx + s->lp[j][0];
             s->lp[j][0] = q->b1*x - q->a1*y + s->lp[j][1];
-            s->lp[j][1] = q->b2*x - q->a2*y;
+            s->lp[j][1] = bx - q->a2*y;
 #else
-            int32_t y = sat(((int64_t)q->b0*x + (int64_t)s->lp[j][0]*268435456) >> 28);
+            int64_t bx = (int64_t)q->b0*x;
+            int32_t y = sat((bx + (int64_t)s->lp[j][0]*268435456) >> 28);
             s->lp[j][0] = sat(((int64_t)q->b1*x - (int64_t)q->a1*y +
                               (int64_t)s->lp[j][1]*268435456) >> 28);
-            s->lp[j][1] = sat(((int64_t)q->b2*x - (int64_t)q->a2*y) >> 28);
+            s->lp[j][1] = sat((bx - (int64_t)q->a2*y) >> 28);
 #endif
             x = y;
         }

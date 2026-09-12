@@ -1936,7 +1936,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 ---
 
 ## RP2040 vs RP2350 Comparison
-*Last updated: 2026-09-07 (spectrum analyser row: LF FFT replaced by continuous bank, protocol V2 and RAM cost; 2026-09-04: subharm row: new parameters and per-output sub meter; wire/slot row V30/V37)*
+*Last updated: 2026-09-12 (spectrum analyser row: FFT ceiling lowered to 1024 points, RAM cost revised; 2026-09-07: LF FFT replaced by continuous bank, protocol V2 and RAM cost; 2026-09-04: subharm row: new parameters and per-output sub meter; wire/slot row V30/V37)*
 
 ### Hardware
 
@@ -1991,7 +1991,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | Crossfeed | Per output pair, post-matrix (PASS 4.5); 2 pairs; `output_pair_mask` (default pair 1) | Per output pair, post-matrix (PASS 4.5); 4 pairs; `output_pair_mask` (default pair 1). Both platforms: shared coeffs, per-pair state, works in every input mode |
 | Psychoacoustic bass | Per output, pre-crossover; RBJ Q28 biquads (with pre-drive low-band clamp) | Per output, pre-crossover; TPT SVF float. Both platforms: missing-fundamental NLD, `output_mask`, zero added latency |
 | Subharmonic synthesizer | Per output, pre-crossover, ahead of psybass; same kernel in Q28 through `fast_mul_q28` (band clamp before the divider); 10-byte sub meter (5 outputs) | Per output, pre-crossover, ahead of psybass; same kernel in float; 18-byte sub meter (9 outputs). Both platforms: TPT SVF band split, hysteresis octave dividers, phase-aligned sum, LF bell, `output_mask`, selectivity, sub ceiling, pair link, runtime solo, headroom reading, zero added latency |
-| Spectrum analyser (RTA) | Q15 `int16_t` kernel; default order 9 (512 points), max 11 (2048); measured per-bin dynamic range 78 dB (`RtaCaps.dynamic_range_db` = 78); 5 tracked channels; ~6.4 KB analyser BSS | Float kernel; default order 10 (1024 points), max 11 (2048); dynamic range 120 dB, limited by the wire level byte rather than arithmetic; 9 tracked channels; ~11.4 KB analyser BSS |
+| Spectrum analyser (RTA) | Q15 `int16_t` kernel; default order 9 (512 points), max 10 (1024); measured per-bin dynamic range 78 dB (`RtaCaps.dynamic_range_db` = 78); 5 tracked channels; ~3.8 KB analyser BSS | Float kernel; default order 10 (1024 points), max 10 (1024); dynamic range 120 dB, limited by the wire level byte rather than arithmetic; 9 tracked channels; ~6.7 KB analyser BSS |
 | Stereo upmixer | Not available (compiled out; matrix untouched) | Stereo input only: derives C/Ls/Rs into matrix rows 2..4 (passive/adaptive/off centre; off/passive/adaptive surround). Zero-latency steering; deliberate per-row surround Haas delay |
 | EQ channels | 7 (NUM_CHANNELS) | 11 (NUM_CHANNELS) |
 
@@ -2066,21 +2066,25 @@ masked, and PDM claims its channel once at init.
 ---
 
 ## Memory Layout
-*Last updated: 2026-09-07 (auxiliary outputs reworked as binding-slot components: +~130 B BSS both platforms, preset directory back to 3035 B at V21; spectrum analyser, single transform up to 2048 points; 2026-08-12: Control Surfaces display, +~750 B BSS both platforms, ~12 KB flash)*
+*Last updated: 2026-09-12 (spectrum analyser FFT ceiling lowered to 1024 points: BSS -2,560 B RP2040 / -4,608 B RP2350, flash -3.5 KB / -6.6 KB; 2026-09-07: auxiliary outputs reworked as binding-slot components: +~130 B BSS both platforms, preset directory back to 3035 B at V21; 2026-08-12: Control Surfaces display, +~750 B BSS both platforms, ~12 KB flash)*
 
-> **Spectrum analyser (2026-09-07).** One capture buffer sized for the largest
-> transform (2048 points): **4,096 B on RP2040 (Q15) / 8,192 B on RP2350
-> (float)**, a 1,041 B bin frame (16 B header + 1024 bin levels + seq tail),
+> **Spectrum analyser (2026-09-12).** One capture buffer sized for the largest
+> transform, now 1024 points: **2,048 B on RP2040 (Q15) / 4,096 B on RP2350
+> (float)**, a 529 B bin frame (16 B header + 512 bin levels + seq tail),
 > per-channel band state (36 float EMA powers + 36 avg + 36 peak bytes + timers
-> per tracked channel: 5 channels on RP2040, 9 on RP2350) and about 120 B of
-> engine state. Measured against HEAD: **BSS +6,448 B RP2040 / +11,456 B
-> RP2350**, RAM image (RAM-pinned tap and packet bookkeeping) +208 B / +296 B,
-> flash text +14.9 KB / +20.7 KB (kernel, engine, handlers, and the 2048-point
-> twiddle and band tables). The `.data` budgets in `scripts/check_ram_placement.py`
-> were raised to 64K / 90K: the RP2040 image had 368 B of headroom and the
-> RP2350 image had already outgrown 72K before this feature. A decimated bass
-> stream and a continuous bass filter bank were both built and removed; the
-> analyser is a single transform. See "Spectrum Analyser (RTA / FFT)".
+> per tracked channel: 5 channels on RP2040, 9 on RP2350) and about 170 B of
+> engine state and response staging. Measured against HEAD: **BSS +3,888 B
+> RP2040 / +6,848 B RP2350**, RAM image (RAM-pinned tap and packet bookkeeping)
+> +208 B / +296 B, flash text +11.4 KB / +14.1 KB (kernel, engine, handlers, and
+> the 1024-point twiddle and band tables). Lowering the ceiling from 2048 to
+> 1024 on 2026-09-12 gave back 2,560 B / 4,608 B of BSS and 3.5 KB / 6.6 KB of
+> flash, at the cost of the lowest bands: the first resolved band at 48 kHz
+> moves from 25 Hz to 50 Hz. The `.data` budgets in
+> `scripts/check_ram_placement.py` were raised to 64K / 90K: the RP2040 image
+> had 368 B of headroom and the RP2350 image had already outgrown 72K before
+> this feature. A decimated bass stream and a continuous bass filter bank were
+> both built and removed; the analyser is a single transform. See "Spectrum
+> Analyser (RTA / FFT)".
 
 > **Input capture arena (2026-08-06).** The `pico_spdif_rx` FIFO (12 KB), the I2S
 > RX rings (4 KB RP2040 / 32 KB RP2350) and the ADAT RX ring (8 KB, RP2350 only)
@@ -3402,7 +3406,7 @@ lands on a hot path and the audio path is untouched.
 | REQ_GET_CS_AUX_STATE | 0x05 | IN | Get an auxiliary output's state (wValue = binding slot: 1 byte; wValue = 0xFFFF: 48 bytes, state[16] then sixteen little-endian 8.8 percent levels, zero on slots that are not up aux outputs) |
 | REQ_SET_CS_AUX_LEVEL | 0x06 | OUT | Set an auxiliary output's level (wValue = binding slot, 2 bytes little-endian 8.8 percent, clamped to 100 % = 25600). Immediate, runtime only; pushes `NOTIFY_EVT_CS_AUX` on a change. Rejected with `CS_STATUS_INVALID_AUX` unless the slot is an up `CS_TYPE_AUX_PWM` |
 | REQ_GET_CS_AUX_LEVEL | 0x07 | IN | Get an auxiliary output's level (wValue = binding slot; 2 bytes little-endian 8.8 percent, 0 on a `CS_TYPE_AUX_OUT` slot) |
-| REQ_RTA_SET_CONFIG | 0x08 | OUT | Set the V2 spectrum analyser config (12-byte `RtaConfig`). STALLs on wrong version or length, unknown tap, an `fft_order` outside the caps range (8..11), an unsupported `lf_mode`, or an empty `channel_mask` after masking to the tap's width |
+| REQ_RTA_SET_CONFIG | 0x08 | OUT | Set the V2 spectrum analyser config (12-byte `RtaConfig`). STALLs on wrong version or length, unknown tap, an `fft_order` outside the caps range (8..10), an unsupported `lf_mode`, or an empty `channel_mask` after masking to the tap's width |
 | REQ_RTA_GET_CONFIG | 0x09 | IN | Get the applied 12-byte `RtaConfig` (clamped `avg_ms` and `peak_decay_db_s`, masked `channel_mask`) |
 | REQ_RTA_GET_CAPS | 0x0A | IN | wValue 0: the 16-byte `RtaCaps`. wValue 1..: a chunk of the band-centre table, 32 `uint16` Hz values per chunk; a chunk past the end STALLs |
 | REQ_RTA_GET_BANDS | 0x0B | IN | wValue = channel; returns that channel's 80-byte `RtaBandFrame` at the applied tap. Counts as a read (auto-off keepalive + auto-start) |
@@ -4572,7 +4576,7 @@ datum is `siggen_raw_mask`, written by Core 0 between blocks.
 ---
 
 ## Spectrum Analyser (RTA / FFT)
-*Last updated: 2026-09-07 (single transform up to 2048 points; bass stream and bass bank removed)*
+*Last updated: 2026-09-12 (FFT ceiling lowered to 1024 points; 2026-09-07: single transform, bass stream and bass bank removed)*
 
 One FFT engine (`rta.c`, kernel in `rta_fft.c`, generated tables in
 `rta_tables.h` from `scripts/gen_rta_tables.py`) that can be pointed at any set
@@ -4618,8 +4622,10 @@ band; a band with no bin at the current size is empty, reads 0, and
 `RtaStatus.first_band` says where resolution starts) with power-domain EMA
 averaging and peak hold whose decay time is carried between publishes; and the
 raw bins of the latest frame. Levels are one byte in 0.5 dB steps with 243 =
-0 dBFS. First resolved band at 48 kHz: 400 Hz at 256 points, 100 Hz at 512,
-50 Hz at 1024, 25 Hz at 2048.
+0 dBFS. First resolved band at 48 kHz: 200 Hz at 256 points, 100 Hz at 512,
+50 Hz at 1024, which is the ceiling. 2048 points would reach 25 Hz and is not
+offered: the capture buffer is always sized for the largest order, so it would
+cost another 4,608 B of BSS on RP2350.
 
 **Bin frame protocol.** `REQ_RTA_GET_BINS` is chunked by byte offset with no
 lock. The frame is `16 + n_bins + 1` bytes with the sequence number in the
@@ -4640,13 +4646,13 @@ during flash writes) and are listed in `scripts/check_ram_placement.py`. The
 transform, the band sums, the twiddle and band tables, and all control paths
 stay in flash.
 
-**Kernel accuracy (host harness, `tools/rta_test/run.sh`, orders 8 to 11).**
+**Kernel accuracy (host harness, `tools/rta_test/run.sh`, orders 8 to 10).**
 Full-scale sine within 0.003 dB in its band; bins within 0.26 dB (float) and
 0.49 dB (Q15) of a numpy Hann FFT; pink noise flat within 0.6 dB; Q15 dynamic
 range 78.5 dB, float 121.5 dB (the wire floor). A tone on a band edge splits
 its Hann main lobe across two bands, so each reads up to 3.01 dB low while the
 pair sums correctly. A -60 dBFS tone reads up to 1.11 dB high in Q15 at 1024
-points and 1.31 dB at 2048, because the band sums more of the Q15 floor.
+points, because the band sums the per-bin Q15 floor across all its bins.
 
 **CPU.** The transform is main-loop work and does not appear in `cpu0_load`;
 `RtaStatus.busy_us_per_s` and `last_frame_us` report it instead. Host

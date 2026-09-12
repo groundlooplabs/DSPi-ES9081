@@ -56,10 +56,10 @@ int main(void) {
     for (int ch=0; ch<NUM_OUTPUT_CHANNELS; ++ch) matrix_mixer.outputs[ch].enabled=true;
     rta_init();
     RtaCaps caps; rta_get_caps(&caps);
-    assert(caps.version==2 && caps.fft_order_max==11 && caps.max_bin_frame==16+1024+1);
+    assert(caps.version==2 && caps.fft_order_max==10 && caps.max_bin_frame==16+512+1);
     RtaConfig cfg; rta_get_config(&cfg);
     cfg.version=1; assert(!rta_set_config(&cfg,sizeof(cfg)));
-    cfg.version=2; cfg.fft_order=12; assert(!rta_set_config(&cfg,sizeof(cfg)));
+    cfg.version=2; cfg.fft_order=11; assert(!rta_set_config(&cfg,sizeof(cfg)));
     cfg.fft_order=caps.fft_order_default; cfg.avg_ms=0;
     assert(rta_set_config(&cfg,sizeof(cfg))); rta_service();
     rta_note_read(); rta_service();
@@ -85,10 +85,10 @@ int main(void) {
     for (int ch=0;ch<NUM_OUTPUT_CHANNELS;ch++) {
         rta_get_band_frame(ch,&f); assert(f.avg[7]==0 && f.age_ms<=400);
     }
-    cfg.fft_order=11; assert(rta_set_config(&cfg,sizeof(cfg))); rta_service();
+    cfg.fft_order=10; assert(rta_set_config(&cfg,sizeof(cfg))); rta_service();
     for (int i=0;i<600;i++) packet(true);
     rta_get_band_frame(0,&f); assert(f.n_bands==31 && f.avg[7]>220);
-    bytes=rta_bin_frame(&len); assert(len==16+1024+1);
+    bytes=rta_bin_frame(&len); assert(len==16+512+1);
     now+=6000000; rta_service(); rta_get_status(&st); assert(st.state==RTA_STATE_IDLE);
     return 0;
 }

@@ -354,9 +354,7 @@ def main():
                 low = check_low_level(lib, fmt, order, rate, tbl)
                 pair, single = check_edges(lib, fmt, order, rate, tbl)
                 flat, match = check_pink(lib, fmt, order, rate, tbl)
-                # Q15 halves every stage, so the band-summed floor under a
-                # quiet tone grows with order; 2048 points buys 0.25 dB more.
-                low_tol = cfg["low_tol"] + (0.25 if (fmt == "q15" and order >= 11) else 0.0)
+                low_tol = cfg["low_tol"]
                 ok = (bw <= btol and fsv <= 0.5 and low <= low_tol
                       and pair <= 0.5 and single <= 3.05 and flat <= 1.0
                       and match <= cfg["bin_tol"] + QUANT
@@ -371,8 +369,8 @@ def main():
     print("""
 bins    worst bin level error vs numpy Hann FFT, dB      (tol 0.35 f32 / 0.75 q15)
 fs-bnd  full-scale sine level error in its band, dB      (tol 0.50)
--60bnd  -60 dBFS sine level error in its band, dB        (tol 0.20 f32 / 1.25 q15, 1.50 at order 11,
-        spec 4.2 asks 1.00 for q15; order 10 measures 1.11, see README)
+-60bnd  -60 dBFS sine level error in its band, dB        (tol 0.20 f32 / 1.25 q15;
+        spec 4.2 asks 1.00 for q15, order 10 measures 1.11, see README)
 edgepr  sine on a band edge, error in the band pair, dB  (tol 0.50)
 edge1   same tone, error in the better single band, dB   (bounded by 3.01, see README)
 pinkfl  pink noise spread across bands >= 12 bins, dB    (tol 1.00)

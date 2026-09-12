@@ -2,8 +2,8 @@
 
 Compiles the analyser kernel (`firmware/DSPi/rta_fft.c`) natively with clang
 in both sample formats (float for RP2350, Q15 for RP2040), drives it from
-Python through ctypes, and checks it against numpy for orders 8 to 11 (256 to
-2048 points) at 44.1, 48 and 96 kHz. A second script compiles the real engine
+Python through ctypes, and checks it against numpy for orders 8 to 10 (256 to
+1024 points) at 44.1, 48 and 96 kHz. A second script compiles the real engine
 (`rta.c`) against stubs and exercises the protocol end to end. Design and
 acceptance criteria: `Documentation/Features/spectrum_analyser_spec.md`,
 section 4.2.
@@ -24,7 +24,7 @@ One row per (format, order, rate):
 |---|---|---|
 | bins | worst bin level error against a numpy Hann FFT | 0.35 dB float, 0.75 dB Q15 |
 | fs-bnd | full-scale sine level error in its band | 0.5 dB |
-| -60bnd | -60 dBFS sine level error in its band | 0.2 dB float; 1.25 dB Q15, 1.5 dB at order 11 |
+| -60bnd | -60 dBFS sine level error in its band | 0.2 dB float; 1.25 dB Q15 |
 | edgepr | sine on a band edge, error of the two-band sum | 0.5 dB |
 | edge1 | same tone, the better single band | never below -3.05 dB |
 | pinkfl | pink noise spread across bands of 12 bins or more | 1.0 dB |
@@ -47,8 +47,8 @@ stated tolerance.
 - **A tone on a band edge reads up to 3.01 dB low in each band.** The Hann main
   lobe splits across the two bands, so the pair sums correctly but no single
   band can. A client that wants a tone's level should sum the pair.
-- **A -60 dBFS sine reads up to 1.11 dB high in Q15 at order 10 and 1.31 dB at
-  order 11.** The band sums the per-bin floor across all its bins, and the
+- **A -60 dBFS sine reads up to 1.11 dB high in Q15 at order 10**, the
+  largest size. The band sums the per-bin floor across all its bins, and the
   floor is closer at higher orders because every stage halves. Order 9, the
   RP2040 default, stays within 0.94 dB.
 - **Two real samples packed into one complex slot give sqrt(2) full scale**,
@@ -60,5 +60,5 @@ stated tolerance.
 The engine compiled with stubbed hardware and time, in both formats: config
 version and order rejection, caps, all-channel rotation cadence on a tone, the
 bin frame layout and seq head/tail, recovery when a channel goes dead
-mid-fill, restart, a switch to 2048 points, and auto-off after 5 s without a
+mid-fill, restart, a switch to the 1024-point ceiling, and auto-off after 5 s without a
 read.

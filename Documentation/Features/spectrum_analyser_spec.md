@@ -1,7 +1,7 @@
 # Spectrum Analyser (RTA / FFT) Specification
 
 *Status: implemented, hardware-untested*
-*Last updated: 2026-09-07 (protocol V2, single transform up to 2048 points)*
+*Last updated: 2026-09-12 (protocol V2, single transform up to 1024 points)*
 
 ## 1. Overview
 
@@ -31,7 +31,7 @@ samples and can transform them itself.
   sample count, so it cannot move any output slot relative to another.
 - **Small.** The transform runs in place in the capture buffer, and every
   constant table lives in flash.
-- **Configurable cost.** FFT size (256 to 2048 points) and averaging let the
+- **Configurable cost.** FFT size (256 to 1024 points) and averaging let the
   user trade CPU and refresh rate for resolution.
 - **Transient only.** Never persisted, off at boot, not part of presets or the
   bulk-params blob, and it switches itself off when nobody is reading it.
@@ -86,15 +86,15 @@ Lowest resolved band per size, at 48 kHz:
 
 | Points | Bin width | First resolved band | Frame time |
 |--------|-----------|---------------------|------------|
-| 256 | 187.5 Hz | 400 Hz | 5 ms |
+| 256 | 187.5 Hz | 200 Hz | 5 ms |
 | 512 | 93.75 Hz | 100 Hz | 11 ms |
 | 1024 | 46.9 Hz | 50 Hz | 21 ms |
-| 2048 | 23.4 Hz | 25 Hz | 43 ms |
 
-At 44.1 kHz each size resolves one band lower; at 96 kHz one band higher.
-Resolving the 20 Hz band would need a 16384-point transform and is not
-offered. A decimated bass stream was built and rejected in favour of this
-simpler single-transform design.
+At 44.1 kHz each size resolves one band lower; at 96 kHz one octave (three
+bands) higher. 1024 points is the ceiling: 2048 would resolve down to 25 Hz
+but costs another 4.6 KB of RAM on RP2350, and resolving the 20 Hz band would
+need 16384 points. A decimated bass stream was built and rejected in favour of
+this simpler single-transform design.
 
 Two arrays are kept per channel: the **averaged** level and the **peak-hold**
 level. Averaging is an exponential moving average in the power domain (not the
@@ -144,7 +144,7 @@ advance: next channel in the selected set, wr = 0, back to FILL
 - **FFT.** `rta_service()` runs from the main loop next to `siggen_service()`.
   Each call performs one bounded unit of the transform and returns: the
   prescale, one butterfly stage, the permutation, or the real-split pass. No
-  unit exceeds roughly 250 µs on RP2040 at 2048 points, so the main loop's
+  unit exceeds roughly 250 µs on RP2040 at the largest size, so the main loop's
   USB and transport duties never stall.
 - **FINISH.** One call applies the window, sums bin powers into bands, writes
   the bin levels, publishes, and advances the rotation. This is the longest
@@ -167,7 +167,6 @@ channels in the set.
 
 | Points | Rate | Fill time | 1 channel | 2 channels | 8 channels |
 |--------|------|-----------|-----------|------------|------------|
-| 2048 | 48 kHz | 42.7 ms | 43 ms | 85 ms | 341 ms |
 | 1024 | 48 kHz | 21.3 ms | 21 ms | 43 ms | 171 ms |
 | 512 | 48 kHz | 10.7 ms | 11 ms | 21 ms | 85 ms |
 | 1024 | 96 kHz | 10.7 ms | 11 ms | 21 ms | 85 ms |
@@ -282,8 +281,8 @@ for every order and both sample formats:
   the pair sums to 0 dBFS within 0.5 dB and the better single band never falls
   below -3.05 dB.
 - A sine at -60 dBFS reads within 0.2 dB (RP2350) or 1.25 dB (RP2040; 1.5 dB
-  at 2048 points, where the band sums more of the Q15 floor). Measured worst
-  cases are 1.11 dB at 1024 and 1.31 dB at 2048 points.
+  where the band sums more of the Q15 floor). The measured worst case is
+  1.11 dB at 1024 points.
 - With a -100 dBFS sine, every bin more than three bins away reads below the
   platform's dynamic-range floor.
 - Pink noise reads flat across bands within 1 dB after averaging 64 frames.
@@ -345,7 +344,7 @@ typedef struct __attribute__((packed)) {
     uint8_t  version;          // RTA_CFG_VERSION
     uint8_t  tap;              // RTA_TAP_*
     uint16_t channel_mask;     // bit i = channel i at that tap; 0 = STALL
-    uint8_t  fft_order;        // 8..11 (256 to 2048 points)
+    uint8_t  fft_order;        // 8..10 (256 to 1024 points)
     uint8_t  reserved0;
     uint16_t avg_ms;           // power-domain EMA time constant, 0 = none
     uint8_t  peak_decay_db_s;  // 0 = peak hold off, else dB per second
@@ -358,14 +357,14 @@ typedef struct __attribute__((packed)) {
     uint8_t  input_channels;   // NUM_INPUT_CHANNELS
     uint8_t  output_channels;  // NUM_OUTPUT_CHANNELS
     uint8_t  fft_order_min;    // 8
-    uint8_t  fft_order_max;    // 11
+    uint8_t  fft_order_max;    // 10
     uint8_t  fft_order_default;// 10 on RP2350, 9 on RP2040
     uint8_t  reserved0;
     uint8_t  max_bands;        // RTA_MAX_BANDS
     uint8_t  level_zero;       // RTA_LEVEL_ZERO_DBFS
     uint8_t  dynamic_range_db; // 78 on RP2040 (measured), 120 on RP2350
     uint16_t idle_timeout_ms;  // RTA_IDLE_TIMEOUT_MS
-    uint16_t max_bin_frame;    // largest bin frame in bytes (1041)
+    uint16_t max_bin_frame;    // largest bin frame in bytes (529)
     uint16_t reserved;
 } RtaCaps;                     // 16 bytes
 
@@ -438,17 +437,18 @@ size restarts the frame (section 3.5). A change of `avg_ms`,
 
 | Item | RP2350 | RP2040 |
 |------|--------|--------|
-| Capture buffer, 2048 points | 8,192 B | 4,096 B |
-| Bin frame (header + 1024 + tail) | 1,041 B | 1,041 B |
-| Per-channel band state: 9 (RP2350) / 5 (RP2040) channels | ~1,980 B | ~1,100 B |
-| Engine state, config, staged config, statistics | ~120 B | ~120 B |
-| **Total BSS** | **~11.4 KB** | **~6.4 KB** |
+| Capture buffer, 1024 points | 4,096 B | 2,048 B |
+| Bin frame (header + 512 + tail) | 529 B | 529 B |
+| Per-channel band state: 9 (RP2350) / 5 (RP2040) channels | 2,052 B | 1,140 B |
+| Engine state, config, staged config, statistics, response staging | ~170 B | ~170 B |
+| **Total BSS** | **6,848 B (~6.7 KB)** | **3,888 B (~3.8 KB)** |
 | RAM image (RAM-pinned tap and packet bookkeeping) | ~0.3 KB | ~0.2 KB |
 
 The capture buffer is sized for the largest order whatever the applied
-config. If RAM ever gets tight it fits inside the idle 8 KB `bulk_param_buf`,
-which already has a claim-and-release lock shared by every transport; that
-overlay is a follow-up, not part of this spec.
+config, which is why the ceiling is 1024 rather than 2048. If RAM ever gets
+tight it fits inside the idle 8 KB `bulk_param_buf`, which already has a
+claim-and-release lock shared by every transport; that overlay is a follow-up,
+not part of this spec.
 
 ### 6.2 CPU
 
@@ -456,18 +456,17 @@ overlay is a follow-up, not part of this spec.
 |---------------|--------|--------|
 | 1024 points (RP2350 default) | < 0.5% of Core 0 | ~1.7% (about 110k cycles per frame, measured on the host) |
 | 512 points (RP2040 default) | < 0.5% | ~1% |
-| 2048 points | < 1% | ~4% |
 | Tap copy in the audio callback | a few µs per block | a few µs per block |
 
 Everything here runs in the main loop, so an over-budget frame shows up as a
 slower refresh, never as an audio fault. The bench figure via
 `RtaStatus.last_frame_us` is still pending; on RP2040 the `FINISH` step (a
 libgcc count-leading-zeros call per bin) is the item most likely to exceed
-the 250 µs step guideline at 2048 points.
+the 250 µs step guideline at 1024 points.
 
 ### 6.3 Flash
 
-Twiddle and band tables: about 14 KB on RP2350 and 8 KB on RP2040. Kernel,
+Twiddle and band tables: about 7.5 KB on RP2350 and 4.5 KB on RP2040. Kernel,
 engine, and handler code: about 6 KB. The tap and the packet begin/end
 bookkeeping are `DSP_TIME_CRITICAL`, because they run inside the meter loops
 on both cores during flash writes. The transform, the band sums, and all

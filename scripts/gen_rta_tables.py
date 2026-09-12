@@ -20,7 +20,7 @@ import sys
 
 # Must match RTA_ORDER_MIN / RTA_ORDER_MAX in rta_fft.h.
 ORDER_MIN = 8
-ORDER_MAX = 11
+ORDER_MAX = 10
 MAX_BANDS = 36
 
 # Device sample rates the analyser supports.

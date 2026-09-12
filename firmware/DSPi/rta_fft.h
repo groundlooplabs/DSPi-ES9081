@@ -37,7 +37,7 @@ typedef int16_t rta_sample_t;    // Q15, full scale = +/-32767
 #endif
 
 #define RTA_ORDER_MIN    8
-#define RTA_ORDER_MAX    11
+#define RTA_ORDER_MAX    10
 #define RTA_MAX_POINTS   (1u << RTA_ORDER_MAX)
 #define RTA_MAX_BANDS    36
 

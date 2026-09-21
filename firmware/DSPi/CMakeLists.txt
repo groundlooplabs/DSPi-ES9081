@@ -99,6 +99,7 @@ add_executable(DSPi
     usb_feedback_controller.c
     usb_feedback_controller.h
     tusb_config.h
+    es9081.h
 )
 
 if (PICO_PLATFORM STREQUAL "rp2040")

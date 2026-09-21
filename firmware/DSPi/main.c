@@ -1714,6 +1714,10 @@ void core0_init() {
     // 307.2MHz -> VCO 1536 MHz / 5 / 1 — integer SPDIF/I2S dividers at 48kHz
     set_sys_clock_pll(1536000000, 5, 1);
 #endif
+    //ES9081 configuration
+    es9081_init(i2c0, PIN_I2C_SDA, PIN_I2C_SCL, PIN_ES9081_EN);
+    es9081_config_apll(i2c0);
+
 
     gpio_init(23); gpio_set_dir(23, GPIO_OUT); gpio_put(23, 1);
 

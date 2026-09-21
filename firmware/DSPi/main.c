@@ -50,6 +50,11 @@
 #include "tusb.h"
 #include "pico/binary_info.h"
 #include "build_info.h"
+#include "es9081.h"
+
+#define PIN_ES9081_EN    20
+#define PIN_I2C_SDA      0
+#define PIN_I2C_SCL      1
 
 // Same stamp REQ_GET_BUILD_INFO reports, embedded in the UF2's binary info
 // so `picotool info` can identify a build file or a BOOTSEL-mode device.
